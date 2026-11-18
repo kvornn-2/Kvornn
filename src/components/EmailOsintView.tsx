@@ -3,6 +3,7 @@ import { MailSearch, ExternalLink, AlertCircle, CheckCircle2, Info } from 'lucid
 import type { EmailOsintReport, PublicUser } from '../types/intel';
 import { useI18n } from '../i18n/I18nContext';
 import { ApiError, apiEmailOsint } from '../utils/api';
+import { isTimestampLikeValue } from '../utils/search';
 import { RecordTable } from './RecordTable';
 
 interface EmailOsintViewProps {
@@ -27,8 +28,6 @@ export function EmailOsintView({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<EmailOsintReport | null>(null);
-
-  const isAdmin = currentUser.role === 'Admin';
 
   const runScanForEmail = async (targetEmail: string) => {
     const trimmed = targetEmail.trim();
@@ -257,12 +256,17 @@ export function EmailOsintView({
             {report.localMatches.length > 0 ? (
               <div className="space-y-3">
                 {(() => {
-                  const linkedIds = Array.from(new Set(report.localMatches.map((r) => r.discordId).filter(Boolean)));
-                  const linkedUsers = Array.from(new Set(report.localMatches.map((r) => r.username).filter(Boolean)));
-                  const linkedContacts = Array.from(
-                    new Set(report.localMatches.flatMap((r) => [r.phone, r.ip]).filter(Boolean)),
+                  const linkedIds = Array.from(new Set(report.localMatches.map((r) => r.discordId.trim()).filter(Boolean)));
+                  const linkedUsers = Array.from(new Set(report.localMatches.map((r) => r.username.trim()).filter(Boolean)));
+                  const linkedPhones = Array.from(
+                    new Set(
+                      report.localMatches
+                        .map((r) => r.phone.trim())
+                        .filter((p) => Boolean(p) && !isTimestampLikeValue(p)),
+                    ),
                   );
-                  const linkedSources = Array.from(new Set(report.localMatches.map((r) => r.source).filter(Boolean)));
+                  const linkedIps = Array.from(new Set(report.localMatches.map((r) => r.ip.trim()).filter(Boolean)));
+                  const linkedSources = Array.from(new Set(report.localMatches.map((r) => r.source.trim()).filter(Boolean)));
                   const linkedNotes = Array.from(new Set(report.localMatches.map((r) => r.notes.trim()).filter(Boolean)));
                   const extraMap = new Map<string, Set<string>>();
                   for (const r of report.localMatches) {
@@ -285,39 +289,54 @@ export function EmailOsintView({
                   if (
                     linkedIds.length === 0 &&
                     linkedUsers.length === 0 &&
-                    linkedContacts.length === 0 &&
+                    linkedPhones.length === 0 &&
+                    linkedIps.length === 0 &&
                     linkedSources.length === 0 &&
                     linkedNotes.length === 0 &&
                     linkedExtra.length === 0
                   ) {
                     return null;
                   }
+                  const renderList = (items: string[], max = 6, colorCls = 'text-slate-900 dark:text-slate-100') =>
+                    items.length > 0 ? (
+                      <ul className="mt-1.5 space-y-1 font-mono">
+                        {items.slice(0, max).map((v, i) => (
+                          <li key={`${v}_${i}`} className={`truncate ${colorCls}`} title={v}>
+                            {v}
+                          </li>
+                        ))}
+                        {items.length > max && (
+                          <li className="text-[11px] font-sans text-slate-400">
+                            +{items.length - max} {t('kayıt daha', 'more')}
+                          </li>
+                        )}
+                      </ul>
+                    ) : (
+                      <div className="mt-1.5 text-slate-400">—</div>
+                    );
+
                   return (
                     <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 text-xs dark:border-slate-800 dark:bg-[#111827]">
-                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
                         <div>
                           <div className="text-slate-500 dark:text-slate-400">Discord ID ({linkedIds.length})</div>
-                          <div className="mt-1 font-mono text-blue-600 dark:text-blue-400">
-                            {linkedIds.length > 0 ? linkedIds.join(', ') : '—'}
-                          </div>
+                          {renderList(linkedIds, 6, 'text-blue-600 dark:text-blue-400')}
                         </div>
                         <div>
                           <div className="text-slate-500 dark:text-slate-400">{t('Kullanıcı Adları', 'Usernames')} ({linkedUsers.length})</div>
-                          <div className="mt-1 font-mono text-slate-900 dark:text-slate-100">
-                            {linkedUsers.length > 0 ? linkedUsers.join(', ') : '—'}
-                          </div>
+                          {renderList(linkedUsers)}
                         </div>
                         <div>
-                          <div className="text-slate-500 dark:text-slate-400">{t('IP & Telefonlar', 'IPs & Phones')} ({linkedContacts.length})</div>
-                          <div className="mt-1 font-mono text-slate-900 dark:text-slate-100">
-                            {linkedContacts.length > 0 ? linkedContacts.join(', ') : '—'}
-                          </div>
+                          <div className="text-slate-500 dark:text-slate-400">{t('Telefonlar', 'Phones')} ({linkedPhones.length})</div>
+                          {renderList(linkedPhones)}
+                        </div>
+                        <div>
+                          <div className="text-slate-500 dark:text-slate-400">{t('IP Adresleri', 'IP Addresses')} ({linkedIps.length})</div>
+                          {renderList(linkedIps)}
                         </div>
                         <div>
                           <div className="text-slate-500 dark:text-slate-400">{t('Kaynaklar', 'Sources')} ({linkedSources.length})</div>
-                          <div className="mt-1 font-mono text-slate-900 dark:text-slate-100">
-                            {linkedSources.length > 0 ? linkedSources.join(', ') : '—'}
-                          </div>
+                          {renderList(linkedSources)}
                         </div>
                       </div>
                       {(linkedExtra.length > 0 || linkedNotes.length > 0) && (
@@ -331,17 +350,24 @@ export function EmailOsintView({
                                 key={item.key}
                                 className="rounded-lg border border-slate-200/80 bg-slate-50/70 px-3 py-1.5 dark:border-slate-800 dark:bg-slate-900/50"
                               >
-                                <span className="font-semibold text-slate-600 dark:text-slate-400">{item.key}: </span>
-                                <span className="break-all font-mono text-slate-900 dark:text-slate-100">
-                                  {item.values.join(', ')}
-                                </span>
+                                <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">{item.key}</div>
+                                <div className="mt-0.5 space-y-0.5 font-mono text-slate-900 dark:text-slate-100">
+                                  {item.values.slice(0, 4).map((val, i) => (
+                                    <div key={i} className="truncate" title={val}>{val}</div>
+                                  ))}
+                                  {item.values.length > 4 && (
+                                    <div className="text-[10px] font-sans text-slate-400">
+                                      +{item.values.length - 4} {t('daha', 'more')}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
                             ))}
                             {linkedNotes.length > 0 && (
                               <div className="rounded-lg border border-slate-200/80 bg-slate-50/70 px-3 py-1.5 dark:border-slate-800 dark:bg-slate-900/50 sm:col-span-2 lg:col-span-3">
                                 <span className="font-semibold text-slate-600 dark:text-slate-400">{t('Notlar:', 'Notes:')} </span>
                                 <span className="break-words font-mono text-slate-900 dark:text-slate-100">
-                                  {linkedNotes.join(' · ')}
+                                  {linkedNotes.slice(0, 5).join(' · ')}
                                 </span>
                               </div>
                             )}
@@ -353,7 +379,6 @@ export function EmailOsintView({
                 })()}
                 <RecordTable
                   records={report.localMatches}
-                  showDatasetName={isAdmin}
                   onPivotQuery={onPivotQuery}
                   onPivotEmail={(em) => void runScanForEmail(em)}
                   testId="email-osint-matches-table"

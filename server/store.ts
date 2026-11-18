@@ -31,7 +31,11 @@ import {
   extractRecordSnowflakes,
   extractRecordUsernames,
   filterDatabaseRecords,
+  hasConflictingDiscordId,
+  isCorrelatableIp,
+  isTimestampLikeValue,
   searchRecords,
+  type IndexedRecordTokens,
   type SearchIndex,
 } from '../src/utils/search.ts';
 import { decodeSnowflake, isValidSnowflake } from '../src/utils/snowflake.ts';
@@ -44,8 +48,10 @@ import {
 import {
   hashAdminKey,
   hashPassword,
+  hashPasswordAsync,
   isReservedUsername,
   verifyPassword,
+  verifyPasswordAsync,
 } from './security.ts';
 
 export interface StoredUser {
@@ -148,9 +154,11 @@ function readJsonFile<T>(filePath: string, fallback: T): T {
   }
 }
 
+let tmpFileSeq = 0;
+
 function writeJsonFile(filePath: string, data: unknown) {
   ensureDir(path.dirname(filePath));
-  const tmp = `${filePath}.tmp`;
+  const tmp = `${filePath}.tmp.${process.pid}.${++tmpFileSeq}`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
   fs.renameSync(tmp, filePath);
 }
@@ -158,7 +166,7 @@ function writeJsonFile(filePath: string, data: unknown) {
 // Streamed chunked NDJSON writer prevents V8 giant-string OOM crashes on massive datasets
 function writeNdjsonRecords(filePath: string, records: IntelRecord[]): number {
   ensureDir(path.dirname(filePath));
-  const tmp = `${filePath}.tmp`;
+  const tmp = `${filePath}.tmp.${process.pid}.${++tmpFileSeq}`;
   const fd = fs.openSync(tmp, 'w', 0o600);
   let totalBytes = 0;
   try {
@@ -250,6 +258,10 @@ export class ServerStore {
   private searchIndex: SearchIndex | null = null;
   private readonly diskIndex: DiskIndex;
   private readonly activeIngestions = new Map<string, AbortController>();
+  private readonly pendingWriteTimers = new Map<string, { timer: NodeJS.Timeout; serialize: () => string }>();
+  private readonly fileWriteQueues = new Map<string, Promise<void>>();
+  private readonly queryCache = new Map<string, { expiresAt: number; result: SearchResult }>();
+  private readonly inflightSearches = new Map<string, Promise<SearchResult>>();
   private secrets!: SecuritySecrets;
   private adminDailyUsed = 0;
   private adminUsageDate = todayKey();
@@ -427,13 +439,76 @@ export class ServerStore {
     return this.secrets.adminTokenEpoch || DEFAULT_ADMIN_TOKEN_EPOCH;
   }
 
+  private writeJsonSyncAndCancelPending(filePath: string, data: unknown) {
+    const pending = this.pendingWriteTimers.get(filePath);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingWriteTimers.delete(filePath);
+    }
+    writeJsonFile(filePath, data);
+  }
+
+  private scheduleJsonWrite(filePath: string, serialize: () => string, delayMs = 350) {
+    const existing = this.pendingWriteTimers.get(filePath);
+    if (existing) {
+      clearTimeout(existing.timer);
+    }
+    const timer = setTimeout(() => {
+      this.pendingWriteTimers.delete(filePath);
+      this.enqueueAsyncFileWrite(filePath, serialize);
+    }, delayMs);
+    timer.unref();
+    this.pendingWriteTimers.set(filePath, { timer, serialize });
+  }
+
+  private enqueueAsyncFileWrite(filePath: string, serialize: () => string): Promise<void> {
+    const prev = this.fileWriteQueues.get(filePath) || Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(async () => {
+        const payload = serialize();
+        const dir = path.dirname(filePath);
+        await fs.promises.mkdir(dir, { recursive: true });
+        const tmp = `${filePath}.tmp.${process.pid}.${++tmpFileSeq}`;
+        await fs.promises.writeFile(tmp, payload, 'utf8');
+        await fs.promises.rename(tmp, filePath);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (this.fileWriteQueues.get(filePath) === next) {
+          this.fileWriteQueues.delete(filePath);
+        }
+      });
+    this.fileWriteQueues.set(filePath, next);
+    return next;
+  }
+
+  async flushPendingWrites(): Promise<void> {
+    const entries = Array.from(this.pendingWriteTimers.entries());
+    this.pendingWriteTimers.clear();
+    const jobs: Promise<void>[] = [];
+    for (const [filePath, item] of entries) {
+      clearTimeout(item.timer);
+      jobs.push(this.enqueueAsyncFileWrite(filePath, item.serialize));
+    }
+    for (const q of this.fileWriteQueues.values()) {
+      jobs.push(q);
+    }
+    await Promise.allSettled(jobs);
+  }
+
+  private invalidateCaches() {
+    this.searchIndex = null;
+    this.queryCache.clear();
+  }
+
   kickAllUsers(clearAccounts = false): { kickedCount: number } {
     const prevCount = this.users.length;
     this.secrets.userTokenEpoch = crypto.randomBytes(8).toString('hex');
     writeJsonFile(this.secretsFile, this.secrets);
     if (clearAccounts) {
       this.users = [];
-      writeJsonFile(this.usersFile, this.users);
+      this.writeJsonSyncAndCancelPending(this.usersFile, this.users);
     }
     return { kickedCount: prevCount };
   }
@@ -579,6 +654,68 @@ export class ServerStore {
     return this.toPublicUser(created);
   }
 
+  async registerUserDirectAsync(
+    email: string,
+    username: string,
+    password: string,
+    clientIp: string,
+    googleUid?: string | null,
+    displayName?: string,
+  ): Promise<PublicUser> {
+    const normEmail = email.trim().toLowerCase();
+    const cleanUser = username.trim();
+
+    if (isReservedUsername(cleanUser)) {
+      throw new Error('Bu kullanıcı adı sistem tarafından ayrılmıştır.');
+    }
+    if (this.users.some((u) => u.email.toLowerCase() === normEmail)) {
+      throw new Error('Bu e-posta adresi ile zaten bir hesap kayıtlı.');
+    }
+    if (googleUid && this.users.some((u) => u.googleUid === googleUid)) {
+      throw new Error('Bu Google hesabı zaten bir kullanıcıya bağlı.');
+    }
+    if (this.users.some((u) => u.username.toLowerCase() === cleanUser.toLowerCase())) {
+      throw new Error('Bu kullanıcı adı zaten alınmış.');
+    }
+
+    const passwordHash = await hashPasswordAsync(password);
+
+    // Re-check uniqueness after yielding during async scrypt
+    if (this.users.some((u) => u.email.toLowerCase() === normEmail)) {
+      throw new Error('Bu e-posta adresi ile zaten bir hesap kayıtlı.');
+    }
+    if (googleUid && this.users.some((u) => u.googleUid === googleUid)) {
+      throw new Error('Bu Google hesabı zaten bir kullanıcıya bağlı.');
+    }
+    if (this.users.some((u) => u.username.toLowerCase() === cleanUser.toLowerCase())) {
+      throw new Error('Bu kullanıcı adı zaten alınmış.');
+    }
+
+    const now = new Date().toISOString();
+    const created: StoredUser = {
+      id: `usr_${crypto.randomUUID()}`,
+      email: normEmail,
+      username: cleanUser,
+      displayName: displayName?.trim() || cleanUser,
+      passwordHash,
+      googleUid: googleUid || null,
+      role: 'Üye',
+      emailVerified: true,
+      banned: false,
+      banReason: '',
+      dailyUsed: 0,
+      usageDate: todayKey(),
+      lastLoginAt: now,
+      lastLoginIp: clientIp,
+      createdAt: now,
+      acceptedTermsAt: now,
+    };
+
+    this.users.push(created);
+    this.scheduleJsonWrite(this.usersFile, () => JSON.stringify(this.users, null, 2), 150);
+    return this.toPublicUser(created);
+  }
+
   loginWithGoogle(uid: string, email: string, clientIp: string): PublicUser | null {
     const normEmail = email.trim().toLowerCase();
     const user = this.users.find(
@@ -592,7 +729,7 @@ export class ServerStore {
     user.emailVerified = true;
     user.lastLoginAt = new Date().toISOString();
     user.lastLoginIp = clientIp;
-    writeJsonFile(this.usersFile, this.users);
+    this.scheduleJsonWrite(this.usersFile, () => JSON.stringify(this.users, null, 2));
     return this.toPublicUser(user);
   }
 
@@ -600,7 +737,7 @@ export class ServerStore {
     const user = this.users.find((u) => u.id === userId);
     if (!user) throw new Error('Kullanıcı bulunamadı.');
     user.emailVerified = true;
-    writeJsonFile(this.usersFile, this.users);
+    this.writeJsonSyncAndCancelPending(this.usersFile, this.users);
     return this.toPublicUser(user);
   }
 
@@ -617,7 +754,25 @@ export class ServerStore {
     user.emailVerified = true;
     user.lastLoginAt = new Date().toISOString();
     user.lastLoginIp = clientIp;
-    writeJsonFile(this.usersFile, this.users);
+    this.scheduleJsonWrite(this.usersFile, () => JSON.stringify(this.users, null, 2));
+    return { user: this.toPublicUser(user) };
+  }
+
+  async authenticateUserAsync(
+    username: string,
+    password: string,
+    clientIp: string,
+  ): Promise<{ user: PublicUser } | null> {
+    const clean = username.trim().toLowerCase();
+    const user = this.users.find((u) => u.username.toLowerCase() === clean);
+    if (!user) return null;
+    const valid = await verifyPasswordAsync(password, user.passwordHash);
+    if (!valid) return null;
+
+    user.emailVerified = true;
+    user.lastLoginAt = new Date().toISOString();
+    user.lastLoginIp = clientIp;
+    this.scheduleJsonWrite(this.usersFile, () => JSON.stringify(this.users, null, 2));
     return { user: this.toPublicUser(user) };
   }
 
@@ -626,7 +781,7 @@ export class ServerStore {
     const user = this.users.find((u) => u.id === userId);
     if (!user) throw new Error('Kullanıcı bulunamadı.');
     user.displayName = displayName.trim() || user.username;
-    writeJsonFile(this.usersFile, this.users);
+    this.writeJsonSyncAndCancelPending(this.usersFile, this.users);
     return this.toPublicUser(user);
   }
 
@@ -649,7 +804,7 @@ export class ServerStore {
     const user = this.users.find((u) => u.id === userId);
     if (!user) throw new Error('Kullanıcı bulunamadı.');
     user.role = role;
-    writeJsonFile(this.usersFile, this.users);
+    this.writeJsonSyncAndCancelPending(this.usersFile, this.users);
     return this.toPublicUser(user);
   }
 
@@ -658,7 +813,7 @@ export class ServerStore {
     if (!user) throw new Error('Kullanıcı bulunamadı.');
     user.banned = banned;
     user.banReason = banned ? banReason.trim() || 'Yönetici tarafından yasaklandı.' : '';
-    writeJsonFile(this.usersFile, this.users);
+    this.writeJsonSyncAndCancelPending(this.usersFile, this.users);
     return this.toPublicUser(user);
   }
 
@@ -687,7 +842,7 @@ export class ServerStore {
     }
 
     user.dailyUsed += 1;
-    writeJsonFile(this.usersFile, this.users);
+    this.scheduleJsonWrite(this.usersFile, () => JSON.stringify(this.users, null, 2));
     return {
       allowed: true,
       remaining: Math.max(0, perms.dailyQueryLimit - user.dailyUsed),
@@ -703,7 +858,7 @@ export class ServerStore {
     };
     this.queryLogs.unshift(log);
     this.queryLogs = this.queryLogs.slice(0, 200);
-    writeJsonFile(this.logsFile, this.queryLogs);
+    this.scheduleJsonWrite(this.logsFile, () => JSON.stringify(this.queryLogs, null, 2));
   }
 
   getQueryAuditLogs(): QueryAuditLog[] {
@@ -718,7 +873,7 @@ export class ServerStore {
     };
     this.blockedAttempts.unshift(record);
     this.blockedAttempts = this.blockedAttempts.slice(0, 200);
-    writeJsonFile(this.blockedAttemptsFile, this.blockedAttempts);
+    this.scheduleJsonWrite(this.blockedAttemptsFile, () => JSON.stringify(this.blockedAttempts, null, 2));
   }
 
   getBlockedAttempts(): BlockedRegistrationAttempt[] {
@@ -1030,6 +1185,7 @@ export class ServerStore {
           live.ingestionStatus = 'ready';
           live.storageMode = 'disk';
           if (live.sizeBytes <= 0) live.sizeBytes = res.shardBytes;
+          this.queryCache.clear();
           writeJsonFile(this.datasetsFile, this.datasets);
         }
       })
@@ -1121,7 +1277,7 @@ export class ServerStore {
     }
     const primaryMatches = Array.from(primaryMap.values());
 
-    // Joint multi-hop transitive correlation across BOTH memory and disk index
+    // Identity-safe multi-hop transitive correlation across BOTH memory and disk index
     const relatedMap = new Map<string, IntelRecord>();
     for (const r of memRes.relatedMatches) {
       if (!primaryMap.has(r.id)) relatedMap.set(r.id, r);
@@ -1141,31 +1297,51 @@ export class ServerStore {
     const pendingUsernames = new Set<string>();
     const pendingExtraIds = new Set<string>();
 
-    const queueTokens = (rec: IntelRecord) => {
-      const cached = memIndex.tokensByRecordId.get(rec.id);
-      const snowflakes = cached ? cached.snowflakes : extractRecordSnowflakes(rec);
-      const emails = cached ? cached.emails : extractRecordEmails(rec);
-      const ips = cached ? cached.ips : extractRecordIps(rec);
-      const phones = cached ? cached.phones : extractRecordPhones(rec);
-      const usernames = cached ? cached.usernames : extractRecordUsernames(rec);
-      const extraIds = cached ? cached.extraIds : extractRecordExtraIdentifiers(rec);
+    const getTokens = (rec: IntelRecord): IndexedRecordTokens =>
+      memIndex.tokensByRecordId.get(rec.id) || {
+        snowflakes: extractRecordSnowflakes(rec),
+        emails: extractRecordEmails(rec),
+        ips: extractRecordIps(rec),
+        phones: extractRecordPhones(rec),
+        usernames: extractRecordUsernames(rec),
+        extraIds: extractRecordExtraIdentifiers(rec),
+      };
 
-      for (const id of snowflakes) if (!visitedDiscordIds.has(id)) pendingDiscordIds.add(id);
-      for (const em of emails) if (!visitedEmails.has(em)) pendingEmails.add(em);
-      for (const ph of phones) if (!visitedPhones.has(ph)) pendingPhones.add(ph);
-      for (const ip of ips) if (!visitedIps.has(ip)) pendingIps.add(ip);
-      for (const un of usernames) if (!visitedUsernames.has(un)) pendingUsernames.add(un);
-      for (const eid of extraIds) if (!visitedExtraIds.has(eid)) pendingExtraIds.add(eid);
+    const queueTokens = (
+      rec: IntelRecord,
+      options: { allowIp: boolean; allowUsername: boolean; allowDiscordIds: boolean },
+    ) => {
+      const tokens = getTokens(rec);
+      if (options.allowDiscordIds) {
+        for (const id of tokens.snowflakes) if (!visitedDiscordIds.has(id)) pendingDiscordIds.add(id);
+      }
+      for (const em of tokens.emails) if (!visitedEmails.has(em)) pendingEmails.add(em);
+      for (const ph of tokens.phones) if (!visitedPhones.has(ph)) pendingPhones.add(ph);
+      if (options.allowIp) {
+        for (const ip of tokens.ips) {
+          if (isCorrelatableIp(ip) && !visitedIps.has(ip)) pendingIps.add(ip);
+        }
+      }
+      if (options.allowUsername) {
+        for (const un of tokens.usernames) if (!visitedUsernames.has(un)) pendingUsernames.add(un);
+      }
+      for (const eid of tokens.extraIds) if (!visitedExtraIds.has(eid)) pendingExtraIds.add(eid);
     };
 
-    for (const r of primaryMatches) queueTokens(r);
-    for (const r of relatedMap.values()) queueTokens(r);
+    for (const r of primaryMatches) queueTokens(r, { allowIp: true, allowUsername: true, allowDiscordIds: true });
+    for (const r of relatedMap.values()) {
+      const tokens = getTokens(r);
+      const hasOtherId = detectedType === 'discord_id' && hasConflictingDiscordId(r, query, tokens.snowflakes);
+      queueTokens(r, { allowIp: !hasOtherId, allowUsername: !hasOtherId, allowDiscordIds: !hasOtherId });
+    }
     if (detectedType === 'discord_id') pendingDiscordIds.add(query);
     else if (detectedType === 'email') pendingEmails.add(qLower);
 
     let hops = 0;
-    const MAX_HOPS = 10;
-    const MAX_RELATED_CAP = 10000;
+    const MAX_HOPS = 6;
+    const MAX_RELATED_CAP = 5000;
+    const MAX_WEAK_BUCKET = 15;
+    const MAX_STRONG_BUCKET = 50;
 
     while (
       hops < MAX_HOPS &&
@@ -1192,56 +1368,89 @@ export class ServerStore {
       pendingUsernames.clear();
       pendingExtraIds.clear();
 
-      const candidates: IntelRecord[] = [];
-      const diskWaveKeys: string[] = [];
+      const strongMap = new Map<string, IntelRecord>();
+      const weakMap = new Map<string, IntelRecord>();
+      const strongDiskKeys: string[] = [];
+      const weakDiskKeys: string[] = [];
+
+      const collectMemBounded = (targetMap: Map<string, IntelRecord>, list: IntelRecord[] | undefined, maxBucket: number) => {
+        if (!list || list.length === 0) return;
+        if (maxBucket > 0 && list.length > maxBucket) return;
+        for (const item of list) targetMap.set(item.id, item);
+      };
 
       for (const id of waveIds) {
         visitedDiscordIds.add(id);
-        diskWaveKeys.push(`id:${id}`);
-        const memHits = memIndex.byDiscordId.get(id);
-        if (memHits) for (const item of memHits) candidates.push(item);
+        strongDiskKeys.push(`id:${id}`);
+        const isDirect = detectedType !== 'discord_id' || id === query;
+        collectMemBounded(strongMap, memIndex.byDiscordId.get(id), isDirect ? 0 : MAX_STRONG_BUCKET);
       }
       for (const em of waveEmails) {
         visitedEmails.add(em);
-        diskWaveKeys.push(`em:${em}`);
-        const memHits = memIndex.byEmail.get(em);
-        if (memHits) for (const item of memHits) candidates.push(item);
+        strongDiskKeys.push(`em:${em}`);
+        collectMemBounded(strongMap, memIndex.byEmail.get(em), MAX_STRONG_BUCKET);
       }
       for (const ph of wavePhones) {
         visitedPhones.add(ph);
-        diskWaveKeys.push(`ph:${ph}`);
-        const memHits = memIndex.byPhone.get(ph);
-        if (memHits) for (const item of memHits) candidates.push(item);
-      }
-      for (const ip of waveIps) {
-        visitedIps.add(ip);
-        diskWaveKeys.push(`ip:${ip}`);
-        const memHits = memIndex.byIp.get(ip);
-        if (memHits) for (const item of memHits) candidates.push(item);
-      }
-      for (const un of waveUsernames) {
-        visitedUsernames.add(un);
-        diskWaveKeys.push(`un:${un}`);
-        const memHits = memIndex.byUsername.get(un);
-        if (memHits) for (const item of memHits) candidates.push(item);
+        strongDiskKeys.push(`ph:${ph}`);
+        collectMemBounded(strongMap, memIndex.byPhone.get(ph), MAX_STRONG_BUCKET);
       }
       for (const eid of waveExtraIds) {
         visitedExtraIds.add(eid);
-        diskWaveKeys.push(`ex:${eid}`);
-        const memHits = memIndex.byExtraIdentifier.get(eid);
-        if (memHits) for (const item of memHits) candidates.push(item);
+        strongDiskKeys.push(`ex:${eid}`);
+        collectMemBounded(strongMap, memIndex.byExtraIdentifier.get(eid), MAX_STRONG_BUCKET);
+      }
+      for (const ip of waveIps) {
+        visitedIps.add(ip);
+        if (!isCorrelatableIp(ip)) continue;
+        weakDiskKeys.push(`ip:${ip}`);
+        collectMemBounded(weakMap, memIndex.byIp.get(ip), MAX_WEAK_BUCKET);
+      }
+      for (const un of waveUsernames) {
+        visitedUsernames.add(un);
+        weakDiskKeys.push(`un:${un}`);
+        collectMemBounded(weakMap, memIndex.byUsername.get(un), MAX_WEAK_BUCKET);
       }
 
-      if (diskWaveKeys.length > 0) {
-        const diskHits = this.diskIndex.lookupRecords(diskWaveKeys, diskDatasetIds, resolveShard);
-        for (const item of diskHits) candidates.push(item);
+      if (strongDiskKeys.length > 0) {
+        const diskStrongHits = this.diskIndex.lookupRecords(strongDiskKeys, diskDatasetIds, resolveShard, MAX_STRONG_BUCKET);
+        for (const item of diskStrongHits) strongMap.set(item.id, item);
+      }
+      if (weakDiskKeys.length > 0) {
+        const diskWeakHits = this.diskIndex.lookupRecords(weakDiskKeys, diskDatasetIds, resolveShard, MAX_WEAK_BUCKET + 1);
+        if (diskWeakHits.length <= MAX_WEAK_BUCKET * weakDiskKeys.length) {
+          for (const item of diskWeakHits) weakMap.set(item.id, item);
+        }
       }
 
-      for (const rec of candidates) {
+      for (const rec of strongMap.values()) {
         if (primaryMap.has(rec.id) || relatedMap.has(rec.id)) continue;
+        const tokens = getTokens(rec);
+        const hasOtherId = detectedType === 'discord_id' && hasConflictingDiscordId(rec, query, tokens.snowflakes);
         relatedMap.set(rec.id, rec);
-        queueTokens(rec);
+        queueTokens(rec, {
+          allowIp: !hasOtherId,
+          allowUsername: true,
+          allowDiscordIds: !hasOtherId,
+        });
         if (relatedMap.size >= MAX_RELATED_CAP) break;
+      }
+
+      if (relatedMap.size < MAX_RELATED_CAP) {
+        for (const rec of weakMap.values()) {
+          if (primaryMap.has(rec.id) || relatedMap.has(rec.id) || strongMap.has(rec.id)) continue;
+          const tokens = getTokens(rec);
+          if (detectedType === 'discord_id' && hasConflictingDiscordId(rec, query, tokens.snowflakes)) {
+            continue;
+          }
+          relatedMap.set(rec.id, rec);
+          queueTokens(rec, {
+            allowIp: false,
+            allowUsername: false,
+            allowDiscordIds: false,
+          });
+          if (relatedMap.size >= MAX_RELATED_CAP) break;
+        }
       }
     }
 
@@ -1251,7 +1460,7 @@ export class ServerStore {
       if (rec.email) s += 2;
       if (rec.username) s += 1;
       if (rec.ip) s += 1;
-      if (rec.phone) s += 1;
+      if (rec.phone && !isTimestampLikeValue(rec.phone)) s += 1;
       if (rec.source) s += 1;
       if (rec.notes) s += 1;
       return s + Math.min(5, Object.keys(rec.extra || {}).length);
@@ -1273,6 +1482,306 @@ export class ServerStore {
         scannedBytes: this.getTotalDataBytes(),
       },
     };
+  }
+
+  private setQueryCache(key: string, result: SearchResult) {
+    if (this.queryCache.size >= 500) {
+      const oldestKey = this.queryCache.keys().next().value;
+      if (oldestKey !== undefined) this.queryCache.delete(oldestKey);
+    }
+    this.queryCache.set(key, {
+      expiresAt: Date.now() + 15_000,
+      result,
+    });
+  }
+
+  async searchAcrossAllStoresAsync(
+    rawQuery: string,
+    mode: QuerySearchMode = 'auto',
+    exactMatch = true,
+  ): Promise<SearchResult> {
+    const query = rawQuery.trim();
+    if (!query) {
+      return this.searchAcrossAllStores(rawQuery, mode, exactMatch);
+    }
+
+    const cacheKey = `${mode}:${exactMatch ? '1' : '0'}:${query.toLowerCase()}`;
+    const cached = this.queryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return {
+        ...cached.result,
+        durationMs: Math.max(0.1, Number(cached.result.durationMs)),
+      };
+    }
+
+    const inflight = this.inflightSearches.get(cacheKey);
+    if (inflight) {
+      return inflight;
+    }
+
+    const task = (async (): Promise<SearchResult> => {
+      const started = performance.now();
+      const detectedType = detectQueryType(query, mode);
+      const snowflake = isValidSnowflake(query) ? decodeSnowflake(query) : null;
+      const stats = this.getStats();
+
+      const memIndex = this.getSearchIndex();
+      const memRes = searchRecords(this.records, query, mode, exactMatch, this.records, memIndex);
+
+      const diskDatasetIds = new Set(
+        this.datasets.filter((d) => d.storageMode === 'disk').map((d) => d.id),
+      );
+      if (diskDatasetIds.size === 0) {
+        const result: SearchResult = {
+          ...memRes,
+          scanMetrics: {
+            scannedRecords: stats.totalRecords,
+            scannedDatasets: stats.totalDatasets,
+            scannedBytes: this.getTotalDataBytes(),
+          },
+        };
+        this.setQueryCache(cacheKey, result);
+        return result;
+      }
+
+      const resolveShard = (dsId: string) => this.getDatasetShardPath(dsId);
+      const qLower = query.toLowerCase();
+      const initialTypedKeys: string[] = [];
+      if (detectedType === 'discord_id') {
+        initialTypedKeys.push(`id:${query}`);
+      } else if (detectedType === 'email') {
+        initialTypedKeys.push(`em:${qLower}`);
+      } else if (detectedType === 'username') {
+        initialTypedKeys.push(`un:${qLower.replace(/^@/, '')}`);
+      } else {
+        initialTypedKeys.push(`id:${query}`, `em:${qLower}`, `un:${qLower.replace(/^@/, '')}`, `ip:${query}`);
+      }
+
+      const diskPrimary = await this.diskIndex.lookupRecordsAsync(initialTypedKeys, diskDatasetIds, resolveShard);
+      const primaryMap = new Map<string, IntelRecord>();
+      for (const r of memRes.primaryMatches) primaryMap.set(r.id, r);
+      for (const r of diskPrimary) {
+        if (!primaryMap.has(r.id)) primaryMap.set(r.id, r);
+      }
+      const primaryMatches = Array.from(primaryMap.values());
+
+      const relatedMap = new Map<string, IntelRecord>();
+      for (const r of memRes.relatedMatches) {
+        if (!primaryMap.has(r.id)) relatedMap.set(r.id, r);
+      }
+
+      const visitedDiscordIds = new Set<string>();
+      const visitedEmails = new Set<string>();
+      const visitedPhones = new Set<string>();
+      const visitedIps = new Set<string>();
+      const visitedUsernames = new Set<string>();
+      const visitedExtraIds = new Set<string>();
+
+      const pendingDiscordIds = new Set<string>();
+      const pendingEmails = new Set<string>();
+      const pendingPhones = new Set<string>();
+      const pendingIps = new Set<string>();
+      const pendingUsernames = new Set<string>();
+      const pendingExtraIds = new Set<string>();
+
+      const getTokens = (rec: IntelRecord): IndexedRecordTokens =>
+        memIndex.tokensByRecordId.get(rec.id) || {
+          snowflakes: extractRecordSnowflakes(rec),
+          emails: extractRecordEmails(rec),
+          ips: extractRecordIps(rec),
+          phones: extractRecordPhones(rec),
+          usernames: extractRecordUsernames(rec),
+          extraIds: extractRecordExtraIdentifiers(rec),
+        };
+
+      const queueTokens = (
+        rec: IntelRecord,
+        options: { allowIp: boolean; allowUsername: boolean; allowDiscordIds: boolean },
+      ) => {
+        const tokens = getTokens(rec);
+        if (options.allowDiscordIds) {
+          for (const id of tokens.snowflakes) if (!visitedDiscordIds.has(id)) pendingDiscordIds.add(id);
+        }
+        for (const em of tokens.emails) if (!visitedEmails.has(em)) pendingEmails.add(em);
+        for (const ph of tokens.phones) if (!visitedPhones.has(ph)) pendingPhones.add(ph);
+        if (options.allowIp) {
+          for (const ip of tokens.ips) {
+            if (isCorrelatableIp(ip) && !visitedIps.has(ip)) pendingIps.add(ip);
+          }
+        }
+        if (options.allowUsername) {
+          for (const un of tokens.usernames) if (!visitedUsernames.has(un)) pendingUsernames.add(un);
+        }
+        for (const eid of tokens.extraIds) if (!visitedExtraIds.has(eid)) pendingExtraIds.add(eid);
+      };
+
+      for (const r of primaryMatches) queueTokens(r, { allowIp: true, allowUsername: true, allowDiscordIds: true });
+      for (const r of relatedMap.values()) {
+        const tokens = getTokens(r);
+        const hasOtherId = detectedType === 'discord_id' && hasConflictingDiscordId(r, query, tokens.snowflakes);
+        queueTokens(r, { allowIp: !hasOtherId, allowUsername: !hasOtherId, allowDiscordIds: !hasOtherId });
+      }
+      if (detectedType === 'discord_id') pendingDiscordIds.add(query);
+      else if (detectedType === 'email') pendingEmails.add(qLower);
+
+      let hops = 0;
+      const MAX_HOPS = 6;
+      const MAX_RELATED_CAP = 5000;
+      const MAX_WEAK_BUCKET = 15;
+      const MAX_STRONG_BUCKET = 50;
+
+      while (
+        hops < MAX_HOPS &&
+        relatedMap.size < MAX_RELATED_CAP &&
+        (pendingDiscordIds.size > 0 ||
+          pendingEmails.size > 0 ||
+          pendingPhones.size > 0 ||
+          pendingIps.size > 0 ||
+          pendingUsernames.size > 0 ||
+          pendingExtraIds.size > 0)
+      ) {
+        hops += 1;
+        const waveIds = Array.from(pendingDiscordIds);
+        const waveEmails = Array.from(pendingEmails);
+        const wavePhones = Array.from(pendingPhones);
+        const waveIps = Array.from(pendingIps);
+        const waveUsernames = Array.from(pendingUsernames);
+        const waveExtraIds = Array.from(pendingExtraIds);
+
+        pendingDiscordIds.clear();
+        pendingEmails.clear();
+        pendingPhones.clear();
+        pendingIps.clear();
+        pendingUsernames.clear();
+        pendingExtraIds.clear();
+
+        const strongMap = new Map<string, IntelRecord>();
+        const weakMap = new Map<string, IntelRecord>();
+        const strongDiskKeys: string[] = [];
+        const weakDiskKeys: string[] = [];
+
+        const collectMemBounded = (targetMap: Map<string, IntelRecord>, list: IntelRecord[] | undefined, maxBucket: number) => {
+          if (!list || list.length === 0) return;
+          if (maxBucket > 0 && list.length > maxBucket) return;
+          for (const item of list) targetMap.set(item.id, item);
+        };
+
+        for (const id of waveIds) {
+          visitedDiscordIds.add(id);
+          strongDiskKeys.push(`id:${id}`);
+          const isDirect = detectedType !== 'discord_id' || id === query;
+          collectMemBounded(strongMap, memIndex.byDiscordId.get(id), isDirect ? 0 : MAX_STRONG_BUCKET);
+        }
+        for (const em of waveEmails) {
+          visitedEmails.add(em);
+          strongDiskKeys.push(`em:${em}`);
+          collectMemBounded(strongMap, memIndex.byEmail.get(em), MAX_STRONG_BUCKET);
+        }
+        for (const ph of wavePhones) {
+          visitedPhones.add(ph);
+          strongDiskKeys.push(`ph:${ph}`);
+          collectMemBounded(strongMap, memIndex.byPhone.get(ph), MAX_STRONG_BUCKET);
+        }
+        for (const eid of waveExtraIds) {
+          visitedExtraIds.add(eid);
+          strongDiskKeys.push(`ex:${eid}`);
+          collectMemBounded(strongMap, memIndex.byExtraIdentifier.get(eid), MAX_STRONG_BUCKET);
+        }
+        for (const ip of waveIps) {
+          visitedIps.add(ip);
+          if (!isCorrelatableIp(ip)) continue;
+          weakDiskKeys.push(`ip:${ip}`);
+          collectMemBounded(weakMap, memIndex.byIp.get(ip), MAX_WEAK_BUCKET);
+        }
+        for (const un of waveUsernames) {
+          visitedUsernames.add(un);
+          weakDiskKeys.push(`un:${un}`);
+          collectMemBounded(weakMap, memIndex.byUsername.get(un), MAX_WEAK_BUCKET);
+        }
+
+        if (strongDiskKeys.length > 0) {
+          const diskStrongHits = await this.diskIndex.lookupRecordsAsync(strongDiskKeys, diskDatasetIds, resolveShard, MAX_STRONG_BUCKET);
+          for (const item of diskStrongHits) strongMap.set(item.id, item);
+        }
+        if (weakDiskKeys.length > 0) {
+          const diskWeakHits = await this.diskIndex.lookupRecordsAsync(weakDiskKeys, diskDatasetIds, resolveShard, MAX_WEAK_BUCKET + 1);
+          if (diskWeakHits.length <= MAX_WEAK_BUCKET * weakDiskKeys.length) {
+            for (const item of diskWeakHits) weakMap.set(item.id, item);
+          }
+        }
+
+        for (const rec of strongMap.values()) {
+          if (primaryMap.has(rec.id) || relatedMap.has(rec.id)) continue;
+          const tokens = getTokens(rec);
+          const hasOtherId = detectedType === 'discord_id' && hasConflictingDiscordId(rec, query, tokens.snowflakes);
+          relatedMap.set(rec.id, rec);
+          queueTokens(rec, {
+            allowIp: !hasOtherId,
+            allowUsername: true,
+            allowDiscordIds: !hasOtherId,
+          });
+          if (relatedMap.size >= MAX_RELATED_CAP) break;
+        }
+
+        if (relatedMap.size < MAX_RELATED_CAP) {
+          for (const rec of weakMap.values()) {
+            if (primaryMap.has(rec.id) || relatedMap.has(rec.id) || strongMap.has(rec.id)) continue;
+            const tokens = getTokens(rec);
+            if (detectedType === 'discord_id' && hasConflictingDiscordId(rec, query, tokens.snowflakes)) {
+              continue;
+            }
+            relatedMap.set(rec.id, rec);
+            queueTokens(rec, {
+              allowIp: false,
+              allowUsername: false,
+              allowDiscordIds: false,
+            });
+            if (relatedMap.size >= MAX_RELATED_CAP) break;
+          }
+        }
+        await new Promise<void>((r) => setImmediate(r));
+      }
+
+      const scoreRec = (rec: IntelRecord): number => {
+        let s = 0;
+        if (rec.discordId) s += 2;
+        if (rec.email) s += 2;
+        if (rec.username) s += 1;
+        if (rec.ip) s += 1;
+        if (rec.phone && !isTimestampLikeValue(rec.phone)) s += 1;
+        if (rec.source) s += 1;
+        if (rec.notes) s += 1;
+        return s + Math.min(5, Object.keys(rec.extra || {}).length);
+      };
+
+      primaryMatches.sort((a, b) => scoreRec(b) - scoreRec(a));
+      const relatedMatches = Array.from(relatedMap.values()).sort((a, b) => scoreRec(b) - scoreRec(a));
+
+      const result: SearchResult = {
+        query,
+        detectedType,
+        snowflake,
+        primaryMatches,
+        relatedMatches,
+        durationMs: Math.max(0.1, Number((performance.now() - started).toFixed(2))),
+        scanMetrics: {
+          scannedRecords: stats.totalRecords,
+          scannedDatasets: stats.totalDatasets,
+          scannedBytes: this.getTotalDataBytes(),
+        },
+      };
+      this.setQueryCache(cacheKey, result);
+      return result;
+    })();
+
+    this.inflightSearches.set(cacheKey, task);
+    try {
+      return await task;
+    } finally {
+      if (this.inflightSearches.get(cacheKey) === task) {
+        this.inflightSearches.delete(cacheKey);
+      }
+    }
   }
 
   runBulkLookupAcrossAllStores(tokens: string[]): BulkQueryRow[] {
@@ -1298,6 +1807,45 @@ export class ServerStore {
         matches: Array.from(dedup.values()),
       };
     });
+  }
+
+  async runBulkLookupAcrossAllStoresAsync(tokens: string[]): Promise<BulkQueryRow[]> {
+    const out: BulkQueryRow[] = new Array(tokens.length);
+    const BATCH = 6;
+    for (let i = 0; i < tokens.length; i += BATCH) {
+      const slice = tokens.slice(i, i + BATCH);
+      const rows = await Promise.all(
+        slice.map(async (token): Promise<BulkQueryRow> => {
+          const valid = isValidSnowflake(token);
+          if (!valid) {
+            return {
+              input: token,
+              validSnowflake: false,
+              snowflake: null,
+              matches: [],
+            };
+          }
+          const res = await this.searchAcrossAllStoresAsync(token, 'discord_id', true);
+          const dedup = new Map<string, IntelRecord>();
+          for (const rec of [...res.primaryMatches, ...res.relatedMatches]) {
+            dedup.set(rec.id, rec);
+          }
+          return {
+            input: token,
+            validSnowflake: true,
+            snowflake: res.snowflake,
+            matches: Array.from(dedup.values()),
+          };
+        }),
+      );
+      for (let j = 0; j < rows.length; j++) {
+        out[i + j] = rows[j];
+      }
+      if (i + BATCH < tokens.length) {
+        await new Promise<void>((r) => setImmediate(r));
+      }
+    }
+    return out;
   }
 
   private recomputeDatasetStats(datasetId: string, knownSizeBytes?: number): DatasetMeta | null {
@@ -1341,7 +1889,7 @@ export class ServerStore {
     for (let i = 0; i < newRecords.length; i++) {
       this.records.push(newRecords[i]);
     }
-    this.searchIndex = null;
+    this.invalidateCaches();
 
     writeJsonFile(this.datasetsFile, this.datasets);
   }
@@ -1376,7 +1924,7 @@ export class ServerStore {
       sizeBytes: currentMeta.sizeBytes + addedBytes,
     };
     this.datasets[dsIdx] = updatedMeta;
-    this.searchIndex = null;
+    this.invalidateCaches();
 
     writeJsonFile(this.datasetsFile, this.datasets);
     return updatedMeta;
@@ -1435,6 +1983,7 @@ export class ServerStore {
         sizeBytes: (currentMeta.sizeBytes || 0) + addedBytes,
       };
       this.datasets[dsIdx] = updatedMeta;
+      this.queryCache.clear();
       writeJsonFile(this.datasetsFile, this.datasets);
       return updatedMeta;
     }
@@ -1488,7 +2037,7 @@ export class ServerStore {
       sizeBytes: writtenBytes,
     };
     this.datasets[dsIdx] = updatedMeta;
-    this.searchIndex = null;
+    this.invalidateCaches();
 
     writeJsonFile(this.datasetsFile, this.datasets);
     return updatedMeta;
@@ -1518,6 +2067,7 @@ export class ServerStore {
         sizeBytes: (ds.sizeBytes || 0) + addedBytes,
       };
       this.datasets[dsIdx] = updatedMeta;
+      this.queryCache.clear();
       writeJsonFile(this.datasetsFile, this.datasets);
       return { dataset: updatedMeta, record: created };
     }
@@ -1525,7 +2075,7 @@ export class ServerStore {
     this.records.push(created);
     const addedBytes = appendNdjsonRecords(this.getDatasetShardPath(datasetId), [created]);
     const updatedMeta = this.recomputeDatasetStats(datasetId, ds.sizeBytes + addedBytes)!;
-    this.searchIndex = null;
+    this.invalidateCaches();
     writeJsonFile(this.datasetsFile, this.datasets);
     return { dataset: updatedMeta, record: created };
   }
@@ -1553,7 +2103,7 @@ export class ServerStore {
     const dsRecords = this.records.filter((r) => r.datasetId === datasetId);
     const writtenBytes = writeNdjsonRecords(this.getDatasetShardPath(datasetId), dsRecords);
     const updatedMeta = this.recomputeDatasetStats(datasetId, writtenBytes)!;
-    this.searchIndex = null;
+    this.invalidateCaches();
     writeJsonFile(this.datasetsFile, this.datasets);
     return { dataset: updatedMeta, record: updated };
   }
@@ -1566,7 +2116,7 @@ export class ServerStore {
     const writtenBytes = writeNdjsonRecords(this.getDatasetShardPath(datasetId), dsRecords);
     const updatedMeta = this.recomputeDatasetStats(datasetId, writtenBytes);
     if (!updatedMeta) throw new Error('Veri deposu bulunamadı.');
-    this.searchIndex = null;
+    this.invalidateCaches();
     writeJsonFile(this.datasetsFile, this.datasets);
     return updatedMeta;
   }
@@ -1583,7 +2133,7 @@ export class ServerStore {
     if (this.datasets.length === before) return false;
     this.deletedDatasetIds.add(datasetId);
     this.records = this.records.filter((r) => r.datasetId !== datasetId);
-    this.searchIndex = null;
+    this.invalidateCaches();
     const shardPath = this.getDatasetShardPath(datasetId);
     if (fs.existsSync(shardPath)) {
       fs.unlinkSync(shardPath);
@@ -1707,6 +2257,7 @@ export class ServerStore {
     }
 
     if (addedIds > 0 || addedEmails > 0) {
+      this.queryCache.clear();
       writeJsonFile(this.blacklistFile, this.getBlacklist());
     }
 
@@ -1727,6 +2278,7 @@ export class ServerStore {
       changed = this.blacklistedEmails.delete(clean.toLowerCase());
     }
     if (changed) {
+      this.queryCache.clear();
       writeJsonFile(this.blacklistFile, this.getBlacklist());
     }
     return this.getBlacklist();
@@ -1837,7 +2389,7 @@ export class ServerStore {
           writeNdjsonRecords(this.getDatasetShardPath(ds.id), recs);
           this.datasets.unshift(ds);
         }
-        this.searchIndex = null;
+        this.invalidateCaches();
         restoredDatasets = newDatasets.length;
         writeJsonFile(this.datasetsFile, this.datasets);
       }

@@ -31,7 +31,7 @@ import {
 import { ServerStore } from './server/store.ts';
 import { runEmailOsint } from './server/emailOsint.ts';
 import { decodeSnowflake, isValidSnowflake } from './src/utils/snowflake.ts';
-import { classifyRecordDatabaseType, filterDatabaseRecords } from './src/utils/search.ts';
+import { classifyRecordDatabaseType, filterDatabaseRecords, sanitizeRecordsForQueryResponse } from './src/utils/search.ts';
 import {
   buildSafeExportFilename,
   recordsToCsv,
@@ -90,17 +90,30 @@ app.use((req, res, next) => {
   next();
 });
 
+function getRateLimitSubject(req: Request): string {
+  const header = req.headers.authorization;
+  const token = header?.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (token) {
+    const payload = verifySessionToken(token, store.getSessionSecret());
+    if (payload?.userId) {
+      return `usr:${payload.userId}`;
+    }
+  }
+  return `ip:${getClientIp(req)}`;
+}
+
 const globalApiLimiter = createRateLimiter({
   windowMs: 60 * 1000,
-  maxRequests: 120,
+  maxRequests: 400,
   keyPrefix: 'api-global',
-  violationWeight: 1,
+  violationWeight: 0,
+  keyGenerator: getRateLimitSubject,
   message: 'Hız sınırı aşıldı (DDoS / Flood koruması). Lütfen 1 dakika içinde tekrar deneyin.',
 });
 
 const authLimiter = createRateLimiter({
   windowMs: 5 * 60 * 1000,
-  maxRequests: 20,
+  maxRequests: 25,
   keyPrefix: 'auth-login',
   violationWeight: 2,
   message: 'Çok fazla oturum veya doğrulama denemesi. Güvenlik için 5 dakika bekleyin.',
@@ -116,17 +129,19 @@ const adminKeyLimiter = createRateLimiter({
 
 const searchLimiter = createRateLimiter({
   windowMs: 60 * 1000,
-  maxRequests: 45,
+  maxRequests: 60,
   keyPrefix: 'query-search',
-  violationWeight: 1,
+  violationWeight: 0,
+  keyGenerator: getRateLimitSubject,
   message: 'Sorgu hız sınırı aşıldı. Lütfen kısa süre bekleyip tekrar deneyin.',
 });
 
 const osintLimiter = createRateLimiter({
   windowMs: 60 * 1000,
-  maxRequests: 20,
+  maxRequests: 30,
   keyPrefix: 'query-osint',
-  violationWeight: 1,
+  violationWeight: 0,
+  keyGenerator: getRateLimitSubject,
   message: 'OSINT tarama hız sınırı aşıldı. Lütfen 1 dakika içinde tekrar deneyin.',
 });
 
@@ -279,6 +294,11 @@ app.delete('/api/admin/upload/:id', ipShieldMiddleware, requireAdmin, (req, res)
   res.json({ ok: deleted, stats: store.getStats() });
 });
 
+// --- Public Health (exempt from globalApiLimiter so Render/LB probes never get 429) ---
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
 app.use('/api', ipShieldMiddleware, globalApiLimiter);
 // Enforce Admin authentication BEFORE accepting large dataset/snapshot JSON bodies (within Cloud Run 32MB ceiling)
 app.use('/api/datasets', requireAdmin, express.json({ limit: '24mb' }), sanitizeRequestBodyMiddleware);
@@ -286,11 +306,6 @@ app.use('/api/admin/datasets', requireAdmin, express.json({ limit: '24mb' }), sa
 app.use('/api/admin/firestore/import-snapshot', requireAdmin, express.json({ limit: '24mb' }), sanitizeRequestBodyMiddleware);
 app.use(express.json({ limit: '256kb' }));
 app.use(sanitizeRequestBodyMiddleware);
-
-// --- Public Health (no internal database counts or identity leaked) ---
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
-});
 
 // --- Auth: Google Account Registration & Google/Username Sign-In ---
 app.post('/api/auth/register', authLimiter, (_req, res) => {
@@ -424,7 +439,7 @@ app.post('/api/auth/google-register', authLimiter, async (req, res) => {
       return;
     }
 
-    const user = store.registerUserDirect(
+    const user = await store.registerUserDirectAsync(
       identity.email,
       username,
       password,
@@ -452,40 +467,44 @@ app.post('/api/auth/google-register', authLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', authLimiter, (req, res) => {
-  const username = sanitizeString(req.body?.username ?? req.body?.identifier, 40);
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+app.post('/api/auth/login', authLimiter, async (req, res, next) => {
+  try {
+    const username = sanitizeString(req.body?.username ?? req.body?.identifier, 40);
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
-  if (!username || !password) {
-    res.status(400).json({ error: 'Kullanıcı adı ve şifre zorunludur.' });
-    return;
-  }
+    if (!username || !password) {
+      res.status(400).json({ error: 'Kullanıcı adı ve şifre zorunludur.' });
+      return;
+    }
 
-  const authRes = store.authenticateUser(username, password, getClientIp(req));
-  if (!authRes) {
-    recordIpViolation(getClientIp(req), 1);
-    const hint =
-      store.getUsersCount() === 0
-        ? " Sunucu yeniden başlatıldıysa lütfen 'Google Hesabı ile Giriş Yap' seçeneğini kullanın."
-        : '';
-    res.status(401).json({ error: `Kullanıcı adı veya şifre hatalı.${hint}` });
-    return;
-  }
-  if (authRes.user.banned) {
-    res.status(403).json({ error: `Hesabınız yasaklandı: ${authRes.user.banReason || 'Yönetici kararı'}` });
-    return;
-  }
+    const authRes = await store.authenticateUserAsync(username, password, getClientIp(req));
+    if (!authRes) {
+      recordIpViolation(getClientIp(req), 1);
+      const hint =
+        store.getUsersCount() === 0
+          ? " Sunucu yeniden başlatıldıysa lütfen 'Google Hesabı ile Giriş Yap' seçeneğini kullanın."
+          : '';
+      res.status(401).json({ error: `Kullanıcı adı veya şifre hatalı.${hint}` });
+      return;
+    }
+    if (authRes.user.banned) {
+      res.status(403).json({ error: `Hesabınız yasaklandı: ${authRes.user.banReason || 'Yönetici kararı'}` });
+      return;
+    }
 
-  const token = signSessionToken(
-    {
-      userId: authRes.user.id,
-      role: authRes.user.role,
-      exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
-      epoch: store.getUserTokenEpoch(),
-    },
-    store.getSessionSecret(),
-  );
-  res.json({ token, user: authRes.user });
+    const token = signSessionToken(
+      {
+        userId: authRes.user.id,
+        role: authRes.user.role,
+        exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+        epoch: store.getUserTokenEpoch(),
+      },
+      store.getSessionSecret(),
+    );
+    res.json({ token, user: authRes.user });
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.post('/api/auth/admin-login', adminKeyLimiter, (req, res) => {
@@ -543,223 +562,220 @@ app.get('/api/auth/me', requireAuth, (req: AuthedRequest, res) => {
   });
 });
 
-function sanitizeRecordsForRole(records: IntelRecord[], isAdmin: boolean): IntelRecord[] {
-  if (isAdmin) {
-    return records.map((r) => ({
-      ...r,
-      dbType: classifyRecordDatabaseType(r),
-    }));
-  }
-  return records.map((r) => ({
-    ...r,
-    dbType: classifyRecordDatabaseType(r),
-    datasetId: '',
-    datasetName: '',
-    source:
-      r.source && r.datasetName && r.source.trim().toLowerCase() === r.datasetName.trim().toLowerCase()
-        ? ''
-        : r.source,
-  }));
+function sanitizeRecordsForRole(records: IntelRecord[], _isAdmin: boolean): IntelRecord[] {
+  return sanitizeRecordsForQueryResponse(records);
 }
 
 // --- ID Lookup (Automatically scans ALL uploaded records + full transitive correlation, uncensored) ---
-app.post('/api/search', requireAuth, searchLimiter, (req: AuthedRequest, res) => {
-  const user = req.currentUser!;
-  if (!user.permissions.canIdLookup) {
-    res.status(403).json({ error: `Rolünüz (${user.role}) ID sorgulama yetkisine sahip değil.` });
-    return;
-  }
+app.post('/api/search', requireAuth, searchLimiter, async (req: AuthedRequest, res, next) => {
+  try {
+    const user = req.currentUser!;
+    if (!user.permissions.canIdLookup) {
+      res.status(403).json({ error: `Rolünüz (${user.role}) ID sorgulama yetkisine sahip değil.` });
+      return;
+    }
 
-  const query = sanitizeString(req.body?.query, 40);
-  if (!query || !isValidSnowflake(query)) {
-    res.status(400).json({ error: 'Lütfen geçerli bir 17-20 haneli Discord ID girin.' });
-    return;
-  }
+    const query = sanitizeString(req.body?.query, 40);
+    if (!query || !isValidSnowflake(query)) {
+      res.status(400).json({ error: 'Lütfen geçerli bir 17-20 haneli Discord ID girin.' });
+      return;
+    }
 
-  if (store.isDiscordIdBlacklisted(query)) {
-    res.status(403).json({
-      error: 'Bu Discord ID kara listede yer aldığı için sorgulanamaz.',
+    if (store.isDiscordIdBlacklisted(query)) {
+      res.status(403).json({
+        error: 'Bu Discord ID kara listede yer aldığı için sorgulanamaz.',
+      });
+      return;
+    }
+
+    const quota = store.consumeQueryQuota(user.id);
+    if (!quota.allowed) {
+      res.status(429).json({
+        error: `Günlük sorgu hakkınız (${quota.limit}) dolmuştur. Kota artışı için yöneticiyle iletişime geçin.`,
+      });
+      return;
+    }
+
+    const rawResult = await store.searchAcrossAllStoresAsync(query, 'discord_id', true);
+    const isAdmin = user.role === 'Admin';
+    const filteredPrimary = rawResult.primaryMatches.filter((r) => !store.isRecordBlacklisted(r));
+    const filteredRelated = rawResult.relatedMatches.filter((r) => !store.isRecordBlacklisted(r));
+
+    store.appendQueryAuditLog({
+      userId: user.id,
+      username: user.username,
+      queryType: 'id_lookup',
+      target: query,
+      matchCount: filteredPrimary.length + filteredRelated.length,
+      ip: getClientIp(req),
     });
-    return;
-  }
 
-  const quota = store.consumeQueryQuota(user.id);
-  if (!quota.allowed) {
-    res.status(429).json({
-      error: `Günlük sorgu hakkınız (${quota.limit}) dolmuştur. Kota artışı için yöneticiyle iletişime geçin.`,
+    res.json({
+      result: {
+        ...rawResult,
+        primaryMatches: sanitizeRecordsForRole(filteredPrimary, isAdmin),
+        relatedMatches: sanitizeRecordsForRole(filteredRelated, isAdmin),
+        maskedByPolicy: false,
+      },
+      user: store.getUserById(user.id),
     });
-    return;
+  } catch (err) {
+    next(err);
   }
+});
 
-  const rawResult = store.searchAcrossAllStores(query, 'discord_id', true);
-  const isAdmin = user.role === 'Admin';
-  const filteredPrimary = rawResult.primaryMatches.filter((r) => !store.isRecordBlacklisted(r));
-  const filteredRelated = rawResult.relatedMatches.filter((r) => !store.isRecordBlacklisted(r));
+app.post('/api/bulk-search', requireAuth, osintLimiter, async (req: AuthedRequest, res, next) => {
+  try {
+    const user = req.currentUser!;
+    if (!user.permissions.canBulkLookup) {
+      res.status(403).json({ error: `Rolünüz (${user.role}) toplu sorgulama özelliğine erişemiyor.` });
+      return;
+    }
 
-  store.appendQueryAuditLog({
-    userId: user.id,
-    username: user.username,
-    queryType: 'id_lookup',
-    target: query,
-    matchCount: filteredPrimary.length + filteredRelated.length,
-    ip: getClientIp(req),
-  });
+    const rawInput = sanitizeString(req.body?.rawInput, 25000);
+    if (!rawInput) {
+      res.status(400).json({ error: 'Taranacak en az bir Discord ID girmelisiniz.' });
+      return;
+    }
 
-  res.json({
-    result: {
-      ...rawResult,
-      primaryMatches: sanitizeRecordsForRole(filteredPrimary, isAdmin),
-      relatedMatches: sanitizeRecordsForRole(filteredRelated, isAdmin),
+    const tokens = Array.from(
+      new Set(
+        rawInput
+          .split(/[\r\n,;\s]+/)
+          .map((t) => t.trim())
+          .filter(Boolean),
+      ),
+    ).slice(0, 500);
+
+    const allowedTokens = tokens.filter((t) => !store.isDiscordIdBlacklisted(t));
+    if (allowedTokens.length === 0 && tokens.length > 0) {
+      res.status(403).json({
+        error: 'Girilen Discord ID veya ID’ler kara listede yer aldığı için sorgulanamaz.',
+      });
+      return;
+    }
+
+    const quota = store.consumeQueryQuota(user.id);
+    if (!quota.allowed) {
+      res.status(429).json({ error: `Günlük sorgu hakkınız (${quota.limit}) dolmuştur.` });
+      return;
+    }
+
+    const allowedLookup = await store.runBulkLookupAcrossAllStoresAsync(allowedTokens);
+    const lookupMap = new Map(allowedLookup.map((row) => [row.input, row]));
+    const isAdmin = user.role === 'Admin';
+
+    const rows = tokens.map((token) => {
+      if (store.isDiscordIdBlacklisted(token)) {
+        return {
+          input: token,
+          validSnowflake: isValidSnowflake(token),
+          blacklisted: true,
+          snowflake: null,
+          matches: [],
+        };
+      }
+      const row = lookupMap.get(token);
+      if (!row) {
+        return {
+          input: token,
+          validSnowflake: isValidSnowflake(token),
+          snowflake: null,
+          matches: [],
+        };
+      }
+      const safeMatches = row.matches.filter((m) => !store.isRecordBlacklisted(m));
+      return {
+        ...row,
+        matches: sanitizeRecordsForRole(safeMatches, isAdmin),
+      };
+    });
+
+    store.appendQueryAuditLog({
+      userId: user.id,
+      username: user.username,
+      queryType: 'bulk_lookup',
+      target: `${rows.length} Discord ID`,
+      matchCount: rows.filter((r) => r.matches.length > 0).length,
+      ip: getClientIp(req),
+    });
+
+    res.json({
+      rows,
       maskedByPolicy: false,
-    },
-    user: store.getUserById(user.id),
-  });
+      user: store.getUserById(user.id),
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.post('/api/bulk-search', requireAuth, osintLimiter, (req: AuthedRequest, res) => {
-  const user = req.currentUser!;
-  if (!user.permissions.canBulkLookup) {
-    res.status(403).json({ error: `Rolünüz (${user.role}) toplu sorgulama özelliğine erişemiyor.` });
-    return;
-  }
+app.post('/api/osint/email', requireAuth, osintLimiter, async (req: AuthedRequest, res, next) => {
+  try {
+    const user = req.currentUser!;
+    if (!user.permissions.canEmailOsint) {
+      res.status(403).json({ error: `Rolünüz (${user.role}) E-posta OSINT modülünü kullanma yetkisine sahip değil.` });
+      return;
+    }
 
-  const rawInput = sanitizeString(req.body?.rawInput, 25000);
-  if (!rawInput) {
-    res.status(400).json({ error: 'Taranacak en az bir Discord ID girmelisiniz.' });
-    return;
-  }
+    const email = sanitizeString(req.body?.email, 180);
+    const lang = req.body?.lang === 'en' ? 'en' : 'tr';
+    if (!email) {
+      res.status(400).json({ error: 'E-posta adresi boş olamaz.' });
+      return;
+    }
 
-  const tokens = Array.from(
-    new Set(
-      rawInput
-        .split(/[\r\n,;\s]+/)
-        .map((t) => t.trim())
-        .filter(Boolean),
-    ),
-  ).slice(0, 500);
+    if (store.isEmailBlacklisted(email)) {
+      res.status(403).json({
+        error: 'Bu e-posta adresi kara listede yer aldığı için sorgulanamaz.',
+      });
+      return;
+    }
 
-  const allowedTokens = tokens.filter((t) => !store.isDiscordIdBlacklisted(t));
-  if (allowedTokens.length === 0 && tokens.length > 0) {
-    res.status(403).json({
-      error: 'Girilen Discord ID veya ID’ler kara listede yer aldığı için sorgulanamaz.',
+    const quota = store.consumeQueryQuota(user.id);
+    if (!quota.allowed) {
+      res.status(429).json({ error: `Günlük sorgu hakkınız (${quota.limit}) dolmuştur.` });
+      return;
+    }
+
+    const hasDiskDatasets = store.getDatasets().some((d) => d.storageMode === 'disk');
+    const allRecords = hasDiskDatasets ? [] : store.getRecords();
+    const [report, crossEmailRes] = await Promise.all([
+      runEmailOsint(email, allRecords, lang, hasDiskDatasets ? undefined : store.getSearchIndex()),
+      hasDiskDatasets ? store.searchAcrossAllStoresAsync(email, 'email', true) : Promise.resolve(null),
+    ]);
+
+    const combinedMap = new Map<string, IntelRecord>();
+    for (const m of report.localMatches) combinedMap.set(m.id, m);
+    if (crossEmailRes) {
+      for (const m of [...crossEmailRes.primaryMatches, ...crossEmailRes.relatedMatches]) {
+        combinedMap.set(m.id, m);
+      }
+    }
+
+    const isAdmin = user.role === 'Admin';
+    const safeLocalMatches = Array.from(combinedMap.values()).filter((m) => !store.isRecordBlacklisted(m));
+
+    store.appendQueryAuditLog({
+      userId: user.id,
+      username: user.username,
+      queryType: 'email_osint',
+      target: email,
+      matchCount: safeLocalMatches.length,
+      ip: getClientIp(req),
     });
-    return;
-  }
 
-  const quota = store.consumeQueryQuota(user.id);
-  if (!quota.allowed) {
-    res.status(429).json({ error: `Günlük sorgu hakkınız (${quota.limit}) dolmuştur.` });
-    return;
-  }
-
-  const allowedLookup = store.runBulkLookupAcrossAllStores(allowedTokens);
-  const lookupMap = new Map(allowedLookup.map((row) => [row.input, row]));
-  const isAdmin = user.role === 'Admin';
-
-  const rows = tokens.map((token) => {
-    if (store.isDiscordIdBlacklisted(token)) {
-      return {
-        input: token,
-        validSnowflake: isValidSnowflake(token),
-        blacklisted: true,
-        snowflake: null,
-        matches: [],
-      };
-    }
-    const row = lookupMap.get(token);
-    if (!row) {
-      return {
-        input: token,
-        validSnowflake: isValidSnowflake(token),
-        snowflake: null,
-        matches: [],
-      };
-    }
-    const safeMatches = row.matches.filter((m) => !store.isRecordBlacklisted(m));
-    return {
-      ...row,
-      matches: sanitizeRecordsForRole(safeMatches, isAdmin),
-    };
-  });
-
-  store.appendQueryAuditLog({
-    userId: user.id,
-    username: user.username,
-    queryType: 'bulk_lookup',
-    target: `${rows.length} Discord ID`,
-    matchCount: rows.filter((r) => r.matches.length > 0).length,
-    ip: getClientIp(req),
-  });
-
-  res.json({
-    rows,
-    maskedByPolicy: false,
-    user: store.getUserById(user.id),
-  });
-});
-
-app.post('/api/osint/email', requireAuth, osintLimiter, async (req: AuthedRequest, res) => {
-  const user = req.currentUser!;
-  if (!user.permissions.canEmailOsint) {
-    res.status(403).json({ error: `Rolünüz (${user.role}) E-posta OSINT modülünü kullanma yetkisine sahip değil.` });
-    return;
-  }
-
-  const email = sanitizeString(req.body?.email, 180);
-  const lang = req.body?.lang === 'en' ? 'en' : 'tr';
-  if (!email) {
-    res.status(400).json({ error: 'E-posta adresi boş olamaz.' });
-    return;
-  }
-
-  if (store.isEmailBlacklisted(email)) {
-    res.status(403).json({
-      error: 'Bu e-posta adresi kara listede yer aldığı için sorgulanamaz.',
+    res.json({
+      report: {
+        ...report,
+        localMatches: sanitizeRecordsForRole(safeLocalMatches, isAdmin),
+      },
+      maskedByPolicy: false,
+      user: store.getUserById(user.id),
     });
-    return;
+  } catch (err) {
+    next(err);
   }
-
-  const quota = store.consumeQueryQuota(user.id);
-  if (!quota.allowed) {
-    res.status(429).json({ error: `Günlük sorgu hakkınız (${quota.limit}) dolmuştur.` });
-    return;
-  }
-
-  const hasDiskDatasets = store.getDatasets().some((d) => d.storageMode === 'disk');
-  const allRecords = hasDiskDatasets ? [] : store.getRecords();
-  const [report, crossEmailRes] = await Promise.all([
-    runEmailOsint(email, allRecords, lang, hasDiskDatasets ? undefined : store.getSearchIndex()),
-    hasDiskDatasets ? Promise.resolve(store.searchAcrossAllStores(email, 'email', true)) : Promise.resolve(null),
-  ]);
-
-  const combinedMap = new Map<string, IntelRecord>();
-  for (const m of report.localMatches) combinedMap.set(m.id, m);
-  if (crossEmailRes) {
-    for (const m of [...crossEmailRes.primaryMatches, ...crossEmailRes.relatedMatches]) {
-      combinedMap.set(m.id, m);
-    }
-  }
-
-  const isAdmin = user.role === 'Admin';
-  const safeLocalMatches = Array.from(combinedMap.values()).filter((m) => !store.isRecordBlacklisted(m));
-
-  store.appendQueryAuditLog({
-    userId: user.id,
-    username: user.username,
-    queryType: 'email_osint',
-    target: email,
-    matchCount: safeLocalMatches.length,
-    ip: getClientIp(req),
-  });
-
-  res.json({
-    report: {
-      ...report,
-      localMatches: sanitizeRecordsForRole(safeLocalMatches, isAdmin),
-    },
-    maskedByPolicy: false,
-    user: store.getUserById(user.id),
-  });
 });
 
 // --- Admin-Only Routes: Datasets, Database Browser, Users, Bans, Roles ---
@@ -1273,10 +1289,41 @@ export class ErrorOverlay {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Sentarika Archive] Sunucu http://0.0.0.0:${PORT} adresinde baslatildi`);
   });
+
+  // Prevent reverse-proxy 502s (keepAliveTimeout > 60s LB idle timeout) & slow-loris hangs
+  httpServer.keepAliveTimeout = 65_000;
+  httpServer.headersTimeout = 66_000;
+  httpServer.requestTimeout = 60_000;
+
+  let shuttingDown = false;
+  const gracefulShutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await store.flushPendingWrites().catch(() => {});
+    httpServer.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+
+  process.on('SIGTERM', () => {
+    void gracefulShutdown();
+  });
+  process.on('SIGINT', () => {
+    void gracefulShutdown();
+  });
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Sentarika Archive] Yakalanmamis Promise reddi:', reason instanceof Error ? reason.message : String(reason));
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Sentarika Archive] Yakalanmamis istisna:', err.message);
+});
 
 startServer().catch((err) => {
   console.error('Sunucu baslatilamadi:', err instanceof Error ? err.message : 'Bilinmeyen hata');

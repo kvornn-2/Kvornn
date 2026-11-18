@@ -4,6 +4,7 @@ import type { BulkQueryRow, PublicUser } from '../types/intel';
 import { useI18n } from '../i18n/I18nContext';
 import { ApiError, apiBulkSearch } from '../utils/api';
 import { formatTurkishDate } from '../utils/snowflake';
+import { isTimestampLikeValue } from '../utils/search';
 
 interface BulkLookupViewProps {
   currentUser: PublicUser;
@@ -153,7 +154,13 @@ export function BulkLookupView({
                       ),
                     );
                     const ips = Array.from(new Set(row.matches.map((m) => m.ip.trim()).filter(Boolean)));
-                    const phones = Array.from(new Set(row.matches.map((m) => m.phone.trim()).filter(Boolean)));
+                    const phones = Array.from(
+                      new Set(
+                        row.matches
+                          .map((m) => m.phone.trim())
+                          .filter((p) => Boolean(p) && !isTimestampLikeValue(p)),
+                      ),
+                    );
                     const notes = Array.from(new Set(row.matches.map((m) => m.notes.trim()).filter(Boolean)));
                     const extraMap = new Map<string, Set<string>>();
                     for (const m of row.matches) {
@@ -169,7 +176,7 @@ export function BulkLookupView({
                         set.add(val);
                       }
                     }
-                    const extraPairs = Array.from(extraMap.entries()).map(([k, set]) => [k, Array.from(set).join(', ')] as const);
+                    const extraPairs = Array.from(extraMap.entries()).map(([k, set]) => [k, Array.from(set).slice(0, 2).join(' / ')] as const);
                     const hasAnyExtra = ips.length > 0 || phones.length > 0 || notes.length > 0 || extraPairs.length > 0;
 
                     return (
@@ -210,39 +217,86 @@ export function BulkLookupView({
                           {row.snowflake ? formatTurkishDate(row.snowflake.createdAtIso) : '—'}
                         </td>
                         <td className="px-4 py-3 align-top font-mono text-slate-800 dark:text-slate-200">
-                          {emails.length > 0 ? emails.join(', ') : '—'}
+                          {emails.length > 0 ? (
+                            <ul className="space-y-0.5">
+                              {emails.slice(0, 3).map((em) => (
+                                <li key={em}>{em}</li>
+                              ))}
+                              {emails.length > 3 && (
+                                <li className="text-[11px] font-sans text-slate-400">
+                                  +{emails.length - 3} {t('daha', 'more')}
+                                </li>
+                              )}
+                            </ul>
+                          ) : (
+                            '—'
+                          )}
                         </td>
                         <td className="px-4 py-3 align-top text-slate-600 dark:text-slate-300">
-                          {userSources.length > 0 ? userSources.join(', ') : '—'}
+                          {userSources.length > 0 ? (
+                            <ul className="space-y-0.5 font-mono">
+                              {userSources.slice(0, 3).map((us) => (
+                                <li key={us}>{us}</li>
+                              ))}
+                              {userSources.length > 3 && (
+                                <li className="text-[11px] font-sans text-slate-400">
+                                  +{userSources.length - 3} {t('daha', 'more')}
+                                </li>
+                              )}
+                            </ul>
+                          ) : (
+                            '—'
+                          )}
                         </td>
                         <td className="px-4 py-3 align-top text-slate-600 dark:text-slate-300">
                           {hasAnyExtra ? (
                             <div className="space-y-1">
                               {ips.length > 0 && (
-                                <div className="font-mono">
-                                  <span className="text-slate-400">IP: </span>
-                                  <span>{ips.join(', ')}</span>
+                                <div className="space-y-0.5 font-mono">
+                                  {ips.slice(0, 3).map((ip) => (
+                                    <div key={ip}>
+                                      <span className="text-slate-400">IP: </span>
+                                      <span>{ip}</span>
+                                    </div>
+                                  ))}
+                                  {ips.length > 3 && (
+                                    <div className="text-[11px] font-sans text-slate-400">
+                                      +{ips.length - 3} IP
+                                    </div>
+                                  )}
                                 </div>
                               )}
                               {phones.length > 0 && (
-                                <div className="font-mono">
-                                  <span className="text-slate-400">{t('Tel:', 'Phone:')} </span>
-                                  <span>{phones.join(', ')}</span>
+                                <div className="space-y-0.5 font-mono">
+                                  {phones.slice(0, 3).map((ph) => (
+                                    <div key={ph}>
+                                      <span className="text-slate-400">{t('Tel:', 'Phone:')} </span>
+                                      <span>{ph}</span>
+                                    </div>
+                                  ))}
+                                  {phones.length > 3 && (
+                                    <div className="text-[11px] font-sans text-slate-400">
+                                      +{phones.length - 3} {t('tel', 'phones')}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                               {notes.length > 0 && (
                                 <div className="max-w-xs break-words text-slate-600 dark:text-slate-400">
-                                  {notes.join(' · ')}
+                                  {notes.slice(0, 2).join(' · ')}
                                 </div>
                               )}
                               {extraPairs.length > 0 && (
                                 <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                                  {extraPairs.map(([k, v]) => (
+                                  {extraPairs.slice(0, 4).map(([k, v]) => (
                                     <span key={k}>
                                       <span className="font-medium text-slate-600 dark:text-slate-300">{k}:</span>{' '}
                                       <span className="font-mono">{v}</span>
                                     </span>
                                   ))}
+                                  {extraPairs.length > 4 && (
+                                    <span className="text-slate-400">+{extraPairs.length - 4}</span>
+                                  )}
                                 </div>
                               )}
                             </div>

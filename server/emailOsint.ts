@@ -689,6 +689,133 @@ async function checkRdap(domain: string): Promise<{
   }
 }
 
+interface CachedExternalOsint {
+  expiresAt: number;
+  isDisposable: boolean;
+  mailProvider: string;
+  mxRecords: { exchange: string; priority: number }[];
+  spfRecord: string | null;
+  dmarcRecord: string | null;
+  rdap: { registrar: string | null; createdDate: string | null; expiryDate: string | null } | null;
+  externalChecks: EmailOsintSourceResult[];
+  pivotLinks: { label: string; url: string }[];
+}
+
+const EXTERNAL_CACHE_TTL_MS = 60_000;
+const MAX_EXTERNAL_CACHE = 500;
+const externalOsintCache = new Map<string, CachedExternalOsint>();
+const inflightExternalOsint = new Map<string, Promise<CachedExternalOsint>>();
+
+async function resolveExternalOsintWithCoalescing(
+  email: string,
+  domain: string,
+  lang: Lang,
+): Promise<CachedExternalOsint> {
+  const cacheKey = `${email}:${lang}`;
+  const cached = externalOsintCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  const inflight = inflightExternalOsint.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const task = (async (): Promise<CachedExternalOsint> => {
+    const [
+      mxRes,
+      txtRes,
+      dmarcRes,
+      disposableRes,
+      rdap,
+      xon,
+      leakCheck,
+      hudsonRock,
+      comb,
+      protonPgp,
+      openPgp,
+      gravatar,
+      github,
+    ] = await Promise.all([
+      dns.resolveMx(domain).catch(() => []),
+      dns.resolveTxt(domain).catch(() => []),
+      dns.resolveTxt(`_dmarc.${domain}`).catch(() => []),
+      checkDisposableEmail(email).catch(() => null),
+      checkRdap(domain),
+      checkXposedOrNot(email, lang),
+      checkLeakCheckPublic(email, lang),
+      checkHudsonRock(email, lang),
+      checkProxyNovaComb(email, lang),
+      checkProtonPgp(email, lang),
+      checkOpenPgp(email, lang),
+      checkGravatar(email, lang),
+      checkGitHub(email, lang),
+    ]);
+
+    const isDisposable = Boolean(disposableRes?.isDisposable);
+    const mxRecords = [...mxRes]
+      .sort((a, b) => a.priority - b.priority)
+      .map((m) => ({ exchange: m.exchange, priority: m.priority }));
+
+    const flatTxt = txtRes.map((chunks) => chunks.join(''));
+    const spfRecord = flatTxt.find((t) => t.toLowerCase().startsWith('v=spf1')) || null;
+
+    const flatDmarc = dmarcRes.map((chunks) => chunks.join(''));
+    const dmarcRecord = flatDmarc.find((t) => t.toLowerCase().startsWith('v=dmarc1')) || null;
+
+    const mailProvider = detectMailProvider(
+      mxRecords.map((m) => m.exchange),
+      domain,
+      lang,
+    );
+
+    const encodedEmail = encodeURIComponent(email);
+    const encodedDomain = encodeURIComponent(domain);
+
+    const pivotLinks = [
+      { label: 'QuadNet OSINT', url: `https://quadnet.xyz/?q=${encodedEmail}` },
+      { label: 'Have I Been Pwned', url: `https://haveibeenpwned.com/account/${encodedEmail}` },
+      { label: 'LeakCheck', url: `https://leakcheck.io/` },
+      { label: 'Epieos OSINT', url: `https://epieos.com/?q=${encodedEmail}` },
+      { label: 'Hudson Rock Cavalier', url: `https://www.hudsonrock.com/free-tools` },
+      { label: 'BreachDirectory', url: `https://breachdirectory.org/` },
+      { label: 'IntelX Search', url: `https://intelx.io/?s=${encodedEmail}` },
+      { label: 'DeHashed', url: `https://dehashed.com/search?query=${encodedEmail}` },
+      { label: 'Hunter.io Domain', url: `https://hunter.io/search/${encodedDomain}` },
+      { label: 'MXToolbox DNS/MX', url: `https://mxtoolbox.com/SuperTool.aspx?action=mx%3a${encodedDomain}` },
+    ];
+
+    const entry: CachedExternalOsint = {
+      expiresAt: Date.now() + EXTERNAL_CACHE_TTL_MS,
+      isDisposable,
+      mailProvider,
+      mxRecords,
+      spfRecord,
+      dmarcRecord,
+      rdap,
+      externalChecks: [xon, leakCheck, hudsonRock, comb, protonPgp, openPgp, gravatar, github],
+      pivotLinks,
+    };
+
+    if (externalOsintCache.size >= MAX_EXTERNAL_CACHE) {
+      const oldestKey = externalOsintCache.keys().next().value;
+      if (oldestKey !== undefined) externalOsintCache.delete(oldestKey);
+    }
+    externalOsintCache.set(cacheKey, entry);
+    return entry;
+  })();
+
+  inflightExternalOsint.set(cacheKey, task);
+  try {
+    return await task;
+  } finally {
+    if (inflightExternalOsint.get(cacheKey) === task) {
+      inflightExternalOsint.delete(cacheKey);
+    }
+  }
+}
+
 export async function runEmailOsint(
   rawEmail: string,
   localRecords: IntelRecord[],
@@ -728,84 +855,21 @@ export async function runEmailOsint(
     };
   }
 
-  // Run all DNS checks, multi-layer temp-mail detection, and 8 free public OSINT APIs simultaneously
-  const [
-    mxRes,
-    txtRes,
-    dmarcRes,
-    disposableRes,
-    rdap,
-    xon,
-    leakCheck,
-    hudsonRock,
-    comb,
-    protonPgp,
-    openPgp,
-    gravatar,
-    github,
-  ] = await Promise.all([
-    dns.resolveMx(domain).catch(() => []),
-    dns.resolveTxt(domain).catch(() => []),
-    dns.resolveTxt(`_dmarc.${domain}`).catch(() => []),
-    checkDisposableEmail(email).catch(() => null),
-    checkRdap(domain),
-    checkXposedOrNot(email, lang),
-    checkLeakCheckPublic(email, lang),
-    checkHudsonRock(email, lang),
-    checkProxyNovaComb(email, lang),
-    checkProtonPgp(email, lang),
-    checkOpenPgp(email, lang),
-    checkGravatar(email, lang),
-    checkGitHub(email, lang),
-  ]);
-
-  const isDisposable = Boolean(disposableRes?.isDisposable);
-
-  const mxRecords = [...mxRes]
-    .sort((a, b) => a.priority - b.priority)
-    .map((m) => ({ exchange: m.exchange, priority: m.priority }));
-
-  const flatTxt = txtRes.map((chunks) => chunks.join(''));
-  const spfRecord = flatTxt.find((t) => t.toLowerCase().startsWith('v=spf1')) || null;
-
-  const flatDmarc = dmarcRes.map((chunks) => chunks.join(''));
-  const dmarcRecord = flatDmarc.find((t) => t.toLowerCase().startsWith('v=dmarc1')) || null;
-
-  const mailProvider = detectMailProvider(
-    mxRecords.map((m) => m.exchange),
-    domain,
-    lang,
-  );
-
-  const encodedEmail = encodeURIComponent(email);
-  const encodedDomain = encodeURIComponent(domain);
-
-  const pivotLinks = [
-    { label: 'QuadNet OSINT', url: `https://quadnet.xyz/?q=${encodedEmail}` },
-    { label: 'Have I Been Pwned', url: `https://haveibeenpwned.com/account/${encodedEmail}` },
-    { label: 'LeakCheck', url: `https://leakcheck.io/` },
-    { label: 'Epieos OSINT', url: `https://epieos.com/?q=${encodedEmail}` },
-    { label: 'Hudson Rock Cavalier', url: `https://www.hudsonrock.com/free-tools` },
-    { label: 'BreachDirectory', url: `https://breachdirectory.org/` },
-    { label: 'IntelX Search', url: `https://intelx.io/?s=${encodedEmail}` },
-    { label: 'DeHashed', url: `https://dehashed.com/search?query=${encodedEmail}` },
-    { label: 'Hunter.io Domain', url: `https://hunter.io/search/${encodedDomain}` },
-    { label: 'MXToolbox DNS/MX', url: `https://mxtoolbox.com/SuperTool.aspx?action=mx%3a${encodedDomain}` },
-  ];
+  const ext = await resolveExternalOsintWithCoalescing(email, domain, lang);
 
   return {
     email,
     domain,
     isValidSyntax: true,
-    isDisposable,
-    mailProvider,
-    mxRecords,
-    spfRecord,
-    dmarcRecord,
-    rdap,
-    externalChecks: [xon, leakCheck, hudsonRock, comb, protonPgp, openPgp, gravatar, github],
+    isDisposable: ext.isDisposable,
+    mailProvider: ext.mailProvider,
+    mxRecords: ext.mxRecords,
+    spfRecord: ext.spfRecord,
+    dmarcRecord: ext.dmarcRecord,
+    rdap: ext.rdap,
+    externalChecks: ext.externalChecks,
     localMatches,
-    pivotLinks,
+    pivotLinks: ext.pivotLinks,
     checkedAt: new Date().toISOString(),
     durationMs: Math.max(1, Number((performance.now() - started).toFixed(2))),
   };

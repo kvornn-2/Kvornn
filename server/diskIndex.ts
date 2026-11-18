@@ -144,14 +144,39 @@ export class DiskIndex {
     fs.mkdirSync(this.indexDir, { recursive: true });
   }
 
-  lookupPostings(typedKey: string, activeDatasetIds: Set<string>, maxHits = 20000): DiskPosting[] {
-    const cleanKey = sanitizeIndexKey(typedKey);
-    if (!cleanKey || activeDatasetIds.size === 0) return [];
-    const bucketIdx = fnv1a32(cleanKey) & 0xff;
+  private parsePostingLine(
+    rest: string,
+    activeDatasetIds: Set<string>,
+    seenOffsetKeys: Set<string>,
+    postings: DiskPosting[],
+  ) {
+    const t1 = rest.indexOf('\t');
+    const t2 = t1 !== -1 ? rest.indexOf('\t', t1 + 1) : -1;
+    if (t1 !== -1 && t2 !== -1) {
+      const dsId = rest.slice(0, t1);
+      if (activeDatasetIds.has(dsId)) {
+        const off = Number(rest.slice(t1 + 1, t2));
+        const len = Number(rest.slice(t2 + 1));
+        if (Number.isFinite(off) && Number.isFinite(len) && len > 0) {
+          const dedupKey = `${dsId}:${off}`;
+          if (!seenOffsetKeys.has(dedupKey)) {
+            seenOffsetKeys.add(dedupKey);
+            postings.push({ datasetId: dsId, byteOffset: off, byteLength: len });
+          }
+        }
+      }
+    }
+  }
+
+  private scanBucketPrefixesSync(
+    bucketIdx: number,
+    prefixes: string[],
+    activeDatasetIds: Set<string>,
+    maxTotal: number,
+  ): DiskPosting[] {
     const bucketPath = path.join(this.indexDir, `b_${bucketIdx.toString(16).padStart(2, '0')}.tsv`);
     if (!fs.existsSync(bucketPath)) return [];
 
-    const prefix = `${cleanKey}\t`;
     const postings: DiskPosting[] = [];
     const seenOffsetKeys = new Set<string>();
     const CHUNK_SIZE = 256 * 1024;
@@ -169,24 +194,12 @@ export class DiskIndex {
         while (nl !== -1) {
           const line = text.slice(start, nl);
           start = nl + 1;
-          if (line.startsWith(prefix)) {
-            const rest = line.slice(prefix.length);
-            const t1 = rest.indexOf('\t');
-            const t2 = t1 !== -1 ? rest.indexOf('\t', t1 + 1) : -1;
-            if (t1 !== -1 && t2 !== -1) {
-              const dsId = rest.slice(0, t1);
-              if (activeDatasetIds.has(dsId)) {
-                const off = Number(rest.slice(t1 + 1, t2));
-                const len = Number(rest.slice(t2 + 1));
-                if (Number.isFinite(off) && Number.isFinite(len) && len > 0) {
-                  const dedupKey = `${dsId}:${off}`;
-                  if (!seenOffsetKeys.has(dedupKey)) {
-                    seenOffsetKeys.add(dedupKey);
-                    postings.push({ datasetId: dsId, byteOffset: off, byteLength: len });
-                    if (postings.length >= maxHits) return postings;
-                  }
-                }
-              }
+          for (let p = 0; p < prefixes.length; p++) {
+            const prefix = prefixes[p];
+            if (line.startsWith(prefix)) {
+              this.parsePostingLine(line.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
+              if (postings.length >= maxTotal) return postings;
+              break;
             }
           }
           nl = text.indexOf('\n', start);
@@ -194,23 +207,13 @@ export class DiskIndex {
         leftover = text.slice(start);
       }
 
-      const tail = leftover + decoder.end();
-      if (tail.startsWith(prefix)) {
-        const rest = tail.slice(prefix.length).trim();
-        const t1 = rest.indexOf('\t');
-        const t2 = t1 !== -1 ? rest.indexOf('\t', t1 + 1) : -1;
-        if (t1 !== -1 && t2 !== -1) {
-          const dsId = rest.slice(0, t1);
-          if (activeDatasetIds.has(dsId)) {
-            const off = Number(rest.slice(t1 + 1, t2));
-            const len = Number(rest.slice(t2 + 1));
-            if (Number.isFinite(off) && Number.isFinite(len) && len > 0) {
-              const dedupKey = `${dsId}:${off}`;
-              if (!seenOffsetKeys.has(dedupKey)) {
-                seenOffsetKeys.add(dedupKey);
-                postings.push({ datasetId: dsId, byteOffset: off, byteLength: len });
-              }
-            }
+      const tail = (leftover + decoder.end()).trim();
+      if (tail) {
+        for (let p = 0; p < prefixes.length; p++) {
+          const prefix = prefixes[p];
+          if (tail.startsWith(prefix)) {
+            this.parsePostingLine(tail.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
+            break;
           }
         }
       }
@@ -219,6 +222,76 @@ export class DiskIndex {
     }
 
     return postings;
+  }
+
+  private async scanBucketPrefixesAsync(
+    bucketIdx: number,
+    prefixes: string[],
+    activeDatasetIds: Set<string>,
+    maxTotal: number,
+  ): Promise<DiskPosting[]> {
+    const bucketPath = path.join(this.indexDir, `b_${bucketIdx.toString(16).padStart(2, '0')}.tsv`);
+    let handle: fs.promises.FileHandle;
+    try {
+      handle = await fs.promises.open(bucketPath, 'r');
+    } catch {
+      return [];
+    }
+
+    const postings: DiskPosting[] = [];
+    const seenOffsetKeys = new Set<string>();
+    const CHUNK_SIZE = 256 * 1024;
+    const buf = Buffer.allocUnsafe(CHUNK_SIZE);
+    const decoder = new StringDecoder('utf8');
+    let leftover = '';
+    let filePos = 0;
+
+    try {
+      while (true) {
+        const { bytesRead } = await handle.read(buf, 0, CHUNK_SIZE, filePos);
+        if (bytesRead === 0) break;
+        filePos += bytesRead;
+        const text = leftover + decoder.write(buf.subarray(0, bytesRead));
+        let start = 0;
+        let nl = text.indexOf('\n', start);
+        while (nl !== -1) {
+          const line = text.slice(start, nl);
+          start = nl + 1;
+          for (let p = 0; p < prefixes.length; p++) {
+            const prefix = prefixes[p];
+            if (line.startsWith(prefix)) {
+              this.parsePostingLine(line.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
+              if (postings.length >= maxTotal) return postings;
+              break;
+            }
+          }
+          nl = text.indexOf('\n', start);
+        }
+        leftover = text.slice(start);
+      }
+
+      const tail = (leftover + decoder.end()).trim();
+      if (tail) {
+        for (let p = 0; p < prefixes.length; p++) {
+          const prefix = prefixes[p];
+          if (tail.startsWith(prefix)) {
+            this.parsePostingLine(tail.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
+            break;
+          }
+        }
+      }
+    } finally {
+      await handle.close().catch(() => {});
+    }
+
+    return postings;
+  }
+
+  lookupPostings(typedKey: string, activeDatasetIds: Set<string>, maxHits = 20000): DiskPosting[] {
+    const cleanKey = sanitizeIndexKey(typedKey);
+    if (!cleanKey || activeDatasetIds.size === 0) return [];
+    const bucketIdx = fnv1a32(cleanKey) & 0xff;
+    return this.scanBucketPrefixesSync(bucketIdx, [`${cleanKey}\t`], activeDatasetIds, maxHits);
   }
 
   readRecordsByPostings(
@@ -268,6 +341,79 @@ export class DiskIndex {
     return results;
   }
 
+  async readRecordsByPostingsAsync(
+    postings: DiskPosting[],
+    resolveShardPath: (datasetId: string) => string,
+  ): Promise<IntelRecord[]> {
+    if (postings.length === 0) return [];
+    const results: IntelRecord[] = [];
+    const openHandles = new Map<string, fs.promises.FileHandle | null>();
+
+    try {
+      for (let i = 0; i < postings.length; i++) {
+        const p = postings[i];
+        let handle = openHandles.get(p.datasetId);
+        if (handle === undefined) {
+          const shardPath = resolveShardPath(p.datasetId);
+          try {
+            handle = await fs.promises.open(shardPath, 'r');
+          } catch {
+            handle = null;
+          }
+          openHandles.set(p.datasetId, handle);
+        }
+        if (!handle) continue;
+
+        const safeLen = Math.min(4 * 1024 * 1024, Math.max(2, p.byteLength));
+        const readBuf = Buffer.allocUnsafe(safeLen);
+        const { bytesRead } = await handle.read(readBuf, 0, safeLen, p.byteOffset);
+        if (bytesRead <= 0) continue;
+        const line = readBuf.subarray(0, bytesRead).toString('utf8').trim();
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line) as IntelRecord;
+          if (parsed && typeof parsed === 'object' && parsed.id) {
+            parsed.dbType = classifyRecordDatabaseType(parsed);
+            results.push(parsed);
+          }
+        } catch {
+          // Ignore malformed line
+        }
+        if (i > 0 && i % 200 === 0) {
+          await new Promise<void>((r) => setImmediate(r));
+        }
+      }
+    } finally {
+      for (const handle of openHandles.values()) {
+        if (handle) {
+          await handle.close().catch(() => {});
+        }
+      }
+    }
+
+    return results;
+  }
+
+  private groupPrefixesByBucket(typedKeys: string[]): Map<number, string[]> {
+    const byBucket = new Map<number, Set<string>>();
+    for (let i = 0; i < typedKeys.length; i++) {
+      const cleanKey = sanitizeIndexKey(typedKeys[i]);
+      if (!cleanKey) continue;
+      const bucketIdx = fnv1a32(cleanKey) & 0xff;
+      let prefixSet = byBucket.get(bucketIdx);
+      if (!prefixSet) {
+        prefixSet = new Set<string>();
+        byBucket.set(bucketIdx, prefixSet);
+      }
+      prefixSet.add(`${cleanKey}\t`);
+    }
+    const grouped = new Map<number, string[]>();
+    for (const [b, set] of byBucket.entries()) {
+      grouped.set(b, Array.from(set));
+    }
+    return grouped;
+  }
+
   lookupRecords(
     typedKeys: string[],
     activeDatasetIds: Set<string>,
@@ -275,11 +421,13 @@ export class DiskIndex {
     maxPerKey = 10000,
   ): IntelRecord[] {
     if (typedKeys.length === 0 || activeDatasetIds.size === 0) return [];
+    const grouped = this.groupPrefixesByBucket(typedKeys);
     const allPostings: DiskPosting[] = [];
     const seenPosting = new Set<string>();
 
-    for (let i = 0; i < typedKeys.length; i++) {
-      const hits = this.lookupPostings(typedKeys[i], activeDatasetIds, maxPerKey);
+    for (const [bucketIdx, prefixes] of grouped.entries()) {
+      const maxBucketHits = Math.min(50_000, maxPerKey * prefixes.length);
+      const hits = this.scanBucketPrefixesSync(bucketIdx, prefixes, activeDatasetIds, maxBucketHits);
       for (let j = 0; j < hits.length; j++) {
         const h = hits[j];
         const k = `${h.datasetId}:${h.byteOffset}`;
@@ -291,6 +439,48 @@ export class DiskIndex {
     }
 
     return this.readRecordsByPostings(allPostings, resolveShardPath);
+  }
+
+  async lookupRecordsAsync(
+    typedKeys: string[],
+    activeDatasetIds: Set<string>,
+    resolveShardPath: (datasetId: string) => string,
+    maxPerKey = 10000,
+  ): Promise<IntelRecord[]> {
+    if (typedKeys.length === 0 || activeDatasetIds.size === 0) return [];
+    const grouped = this.groupPrefixesByBucket(typedKeys);
+    const bucketEntries = Array.from(grouped.entries());
+    const allPostings: DiskPosting[] = [];
+    const seenPosting = new Set<string>();
+
+    // Scan buckets with bounded concurrency so concurrent queries interleave smoothly
+    const BUCKET_CONCURRENCY = 4;
+    for (let i = 0; i < bucketEntries.length; i += BUCKET_CONCURRENCY) {
+      const slice = bucketEntries.slice(i, i + BUCKET_CONCURRENCY);
+      const batchResults = await Promise.all(
+        slice.map(([bucketIdx, prefixes]) =>
+          this.scanBucketPrefixesAsync(
+            bucketIdx,
+            prefixes,
+            activeDatasetIds,
+            Math.min(50_000, maxPerKey * prefixes.length),
+          ),
+        ),
+      );
+      for (let b = 0; b < batchResults.length; b++) {
+        const hits = batchResults[b];
+        for (let j = 0; j < hits.length; j++) {
+          const h = hits[j];
+          const k = `${h.datasetId}:${h.byteOffset}`;
+          if (!seenPosting.has(k)) {
+            seenPosting.add(k);
+            allPostings.push(h);
+          }
+        }
+      }
+    }
+
+    return this.readRecordsByPostingsAsync(allPostings, resolveShardPath);
   }
 }
 

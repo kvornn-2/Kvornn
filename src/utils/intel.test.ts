@@ -634,5 +634,100 @@ test('parseDatasetSample handles ULP https:// URLs, truncated JSON arrays, and 1
   assert.equal(bigResult.rows.length, 160_000);
 });
 
+test('Conflicting foreign Discord IDs sharing CDN IPs, shared IPs, timestamp-like phones, dummy phones, or short hex usernames never leak', () => {
+  const csvWithTimestamps = [
+    'discord_id,username,ip,last_login,source',
+    '701810803321471176,53775969,172.70.51.219,2025-07-26 19:17:38,data-2',
+    '289104567890123456,foreign_cf,172.70.51.219,2025-07-26 19:17:38,data-2',
+    '452910384756192012,foreign_dns,1.1.1.1,123456789,data_part2.csv',
+  ].join('\n');
+
+  const parsed = parseDatasetContent(csvWithTimestamps, 'data_part2.csv');
+  const records = normalizeRows(parsed.rows, parsed.suggestedMapping, 'ds_part2', 'data_part2');
+
+  // last_login timestamp is NOT mistreated as a phone number
+  assert.equal(records[0].phone, '');
+
+  const pool: IntelRecord[] = [
+    ...records,
+    {
+      id: 'foreign_shared_ip',
+      datasetId: 'ds_other',
+      datasetName: 'OtherDump',
+      discordId: '999888777666555444',
+      email: 'stranger@example.test',
+      username: 'ff0',
+      source: 'ForumDB',
+      ip: '198.51.100.77',
+      phone: '123456789',
+      notes: '',
+      extra: {},
+    },
+    {
+      id: 'target_with_real_ip',
+      datasetId: 'ds_other',
+      datasetName: 'OtherDump',
+      discordId: '701810803321471176',
+      email: '',
+      username: 'ff0',
+      source: 'ForumDB',
+      ip: '198.51.100.77',
+      phone: '',
+      notes: '',
+      extra: {},
+    },
+    {
+      id: 'unattributed_real_phone',
+      datasetId: 'ds_shop',
+      datasetName: 'ShopDump',
+      discordId: '',
+      email: 'verified.shop@example.test',
+      username: 'real_shopper',
+      source: 'ShopDB',
+      ip: '',
+      phone: '+905551112233',
+      notes: '',
+      extra: {},
+    },
+    {
+      id: 'target_real_phone',
+      datasetId: 'ds_tel',
+      datasetName: 'TelDump',
+      discordId: '701810803321471176',
+      email: '',
+      username: '',
+      source: 'TelDB',
+      ip: '',
+      phone: '05551112233',
+      notes: '',
+      extra: { hwid: 'HWID-EXACT-701' },
+    },
+    {
+      id: 'unattributed_hwid',
+      datasetId: 'ds_ac',
+      datasetName: 'ACDump',
+      discordId: '',
+      email: '',
+      username: 'hwid_alt',
+      source: 'AntiCheat',
+      ip: '',
+      phone: '',
+      notes: '',
+      extra: { hw_id: 'HWID-EXACT-701' },
+    },
+  ];
+
+  const idx = buildSearchIndex(pool);
+  const res = searchRecords(pool, '701810803321471176', 'discord_id', true, pool, idx);
+
+  assert.equal(res.primaryMatches.length, 2);
+  const relatedIds = res.relatedMatches.map((r) => r.id).sort();
+  assert.deepEqual(relatedIds, ['unattributed_hwid', 'unattributed_real_phone']);
+  // Conflicting foreign Discord IDs sharing CF IP, shared residential IP, dummy phone, or short hex "ff0" are excluded
+  assert.equal(relatedIds.includes('foreign_shared_ip'), false);
+  assert.equal(res.relatedMatches.some((r) => r.discordId && r.discordId !== '701810803321471176'), false);
+});
+
+
 
 

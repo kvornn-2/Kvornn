@@ -97,7 +97,100 @@ const JUNK_USERNAMES = new Set([
   '—',
 ]);
 
-const JUNK_IPS = new Set(['0.0.0.0', '127.0.0.1', 'localhost', '::1', '::']);
+const JUNK_IPS = new Set([
+  '0.0.0.0',
+  '127.0.0.1',
+  '1.1.1.1',
+  '1.0.0.1',
+  '8.8.8.8',
+  '8.8.4.4',
+  '9.9.9.9',
+  'localhost',
+  '::1',
+  '::',
+]);
+
+const TIMESTAMP_STRING_RE =
+  /^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T\s]+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?$|^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}(?:[T\s]+\d{1,2}:\d{2}(?::\d{2})?)?$/;
+
+export function isTimestampLikeValue(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  return TIMESTAMP_STRING_RE.test(trimmed);
+}
+
+function parseIpv4ToInt(ip: string): number | null {
+  const parts = ip.trim().split('.');
+  if (parts.length !== 4) return null;
+  let out = 0;
+  for (let i = 0; i < 4; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return null;
+    const n = Number(parts[i]);
+    if (n < 0 || n > 255) return null;
+    out = (out * 256) + n;
+  }
+  return out >>> 0;
+}
+
+const NON_CORRELATABLE_IP_CIDRS: Array<[number, number]> = [
+  // RFC1918, Loopback, Link-Local, CGNAT, Unspecified
+  [0x00000000, 0xff000000], // 0.0.0.0/8
+  [0x0a000000, 0xff000000], // 10.0.0.0/8
+  [0x64400000, 0xffc00000], // 100.64.0.0/10
+  [0x7f000000, 0xff000000], // 127.0.0.0/8
+  [0xa9fe0000, 0xffff0000], // 169.254.0.0/16
+  [0xac100000, 0xfff00000], // 172.16.0.0/12
+  [0xc0a80000, 0xffff0000], // 192.168.0.0/16
+  // Cloudflare edge / proxy IPv4 ranges
+  [0x6715f400, 0xfffffc00], // 103.21.244.0/22
+  [0x6716c800, 0xfffffc00], // 103.22.200.0/22
+  [0x671f0400, 0xfffffc00], // 103.31.4.0/22
+  [0x68100000, 0xfff80000], // 104.16.0.0/13
+  [0x68180000, 0xfffc0000], // 104.24.0.0/14
+  [0x6ca2c000, 0xffffc000], // 108.162.192.0/18
+  [0x83004800, 0xfffffc00], // 131.0.72.0/22
+  [0x8d654000, 0xffffc000], // 141.101.64.0/18
+  [0xa29e0000, 0xfffe0000], // 162.158.0.0/15
+  [0xac400000, 0xfff80000], // 172.64.0.0/13
+  [0xadf53000, 0xfffff000], // 173.245.48.0/20
+  [0xbc726000, 0xfffff000], // 188.114.96.0/20
+  [0xbe5df000, 0xfffff000], // 190.93.240.0/20
+  [0xc5eaf000, 0xfffffc00], // 197.234.240.0/22
+  [0xc6298000, 0xffff8000], // 198.41.128.0/17
+];
+
+export function isCorrelatableIp(rawIp: string): boolean {
+  const clean = rawIp.trim().toLowerCase();
+  if (!clean || JUNK_IPS.has(clean)) return false;
+  if (clean.includes(':')) {
+    if (
+      clean === '::' ||
+      clean === '::1' ||
+      clean.startsWith('fe80:') ||
+      clean.startsWith('fc') ||
+      clean.startsWith('fd') ||
+      clean.startsWith('2606:4700:') ||
+      clean.startsWith('2400:cb00:') ||
+      clean.startsWith('2803:f800:') ||
+      clean.startsWith('2405:b500:') ||
+      clean.startsWith('2405:8100:') ||
+      clean.startsWith('2a06:98c0:') ||
+      clean.startsWith('2c0f:f248:')
+    ) {
+      return false;
+    }
+    return true;
+  }
+  const ipInt = parseIpv4ToInt(clean);
+  if (ipInt === null) return false;
+  for (let i = 0; i < NON_CORRELATABLE_IP_CIDRS.length; i++) {
+    const [network, mask] = NON_CORRELATABLE_IP_CIDRS[i];
+    if ((ipInt & mask) >>> 0 === network >>> 0) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -118,10 +211,14 @@ function containsExactToken(text: string, token: string): boolean {
 export function normalizePhoneKey(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed || IPV4_TOKEN_RE.test(trimmed)) return '';
+  if (trimmed.includes(':') || isTimestampLikeValue(trimmed)) return '';
   const digits = trimmed.replace(/\D/g, '');
   if (digits.length < 9 || digits.length > 15) return '';
   if (isValidSnowflake(digits)) return '';
-  if (/^\d{4}[-/.]\d{2}[-/.]\d{2}$/.test(trimmed)) return '';
+  // Reject repeated digits (e.g. 000000000, 111111111) or sequential dummy patterns (123456789)
+  if (/^(\d)\1{5,}$/.test(digits)) return '';
+  if ('0123456789012345'.includes(digits) || '9876543210987654'.includes(digits)) return '';
+  if (/^(123)+1?2?3?$/.test(digits)) return '';
   return digits.length >= 10 ? digits.slice(-10) : digits;
 }
 
@@ -175,11 +272,11 @@ export function extractRecordIps(rec: IntelRecord): string[] {
     const matches = txt.match(IPV4_TOKEN_RE);
     if (!matches) return;
     for (const ip of matches) {
-      if (!JUNK_IPS.has(ip)) out.add(ip);
+      if (isCorrelatableIp(ip)) out.add(ip);
     }
   };
   const direct = rec.ip.trim().toLowerCase();
-  if (direct && !JUNK_IPS.has(direct)) {
+  if (direct && isCorrelatableIp(direct)) {
     if (direct.includes(':') && /^[0-9a-f:]+$/.test(direct)) out.add(direct);
     else addFromText(direct);
   }
@@ -190,12 +287,15 @@ export function extractRecordIps(rec: IntelRecord): string[] {
   return Array.from(out);
 }
 
+const NON_PHONE_EXTRA_KEY_RE =
+  /^(id|uid|user_id|userid|discord_id|ip|ip_address|registration_ip|last_ip|login_ip|ip2|last_login|created_at|updated_at|registered_at|last_seen|timestamp|date|time|tarih|kayit_tarihi|son_giris|expires_at|created|updated|hash|avatar_hash|token|password|pass)$/i;
+
 export function extractRecordPhones(rec: IntelRecord): string[] {
   const out = new Set<string>();
   const directKey = normalizePhoneKey(rec.phone);
   if (directKey) out.add(directKey);
   const scanText = (txt: string) => {
-    if (!txt) return;
+    if (!txt || isTimestampLikeValue(txt)) return;
     const matches = txt.match(PHONE_CANDIDATE_RE);
     if (!matches) return;
     for (const m of matches) {
@@ -204,7 +304,9 @@ export function extractRecordPhones(rec: IntelRecord): string[] {
     }
   };
   scanText(rec.notes);
-  for (const val of Object.values(rec.extra || {})) {
+  for (const [key, val] of Object.entries(rec.extra || {})) {
+    const cleanKey = key.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (NON_PHONE_EXTRA_KEY_RE.test(cleanKey)) continue;
     scanText(val);
   }
   return Array.from(out);
@@ -214,7 +316,7 @@ const EXTRA_USERNAME_KEY_RE =
   /^(username|user|nick|nickname|handle|discord_tag|tag|kullanici|kullanici_adi|display_name|global_name|telegram|tg|instagram|ig|twitter|x_handle)$/i;
 
 const HIGH_SIGNAL_EXTRA_KEY_RE =
-  /^(tc|tckn|tc_no|kimlik|ssn|passport|iban|hwid|hw_id|device_id|mac|mac_address|serial|uuid|guid|steam|steam_id|steamid|roblox|roblox_id|telegram|tg|instagram|ig|twitter|x_handle|tiktok|youtube|twitch|kick|github|spotify|wallet|btc|eth|sol|address|adres|ev_adresi|discord_tag|tag|alt_id|backup_id|alt_email|recovery_email|secondary_email|secondary_phone|tel2|gsm2|phone2|ip2|last_ip|reg_ip|login_ip|full_name|ad_soyad|isim_soyisim)$/i;
+  /^(tc|tckn|tc_no|kimlik|ssn|passport|iban|hwid|hw_id|device_id|mac|mac_address|serial|uuid|guid|steam|steam_id|steamid|roblox|roblox_id|telegram|tg|instagram|ig|twitter|x_handle|tiktok|youtube|twitch|kick|github|spotify|wallet|btc|eth|sol|address|adres|ev_adresi|discord_tag|tag|alt_id|backup_id|alt_email|recovery_email|secondary_email|secondary_phone|tel2|gsm2|phone2|full_name|ad_soyad|isim_soyisim)$/i;
 
 const GENERIC_JUNK_VALUES = new Set([
   ...JUNK_USERNAMES,
@@ -241,7 +343,14 @@ export function extractRecordUsernames(rec: IntelRecord): string[] {
   const out = new Set<string>();
   const addUser = (rawVal: string) => {
     const raw = rawVal.trim().replace(/^@/, '').toLowerCase();
-    if (raw.length >= 3 && !GENERIC_JUNK_VALUES.has(raw) && !/^\d+$/.test(raw) && !raw.includes('@')) {
+    // Require >= 4 chars and exclude pure numbers or short hex fragments (e.g. ff0, bac5, 67c)
+    if (
+      raw.length >= 4 &&
+      !GENERIC_JUNK_VALUES.has(raw) &&
+      !/^\d+$/.test(raw) &&
+      !/^[0-9a-f]{4,6}$/.test(raw) &&
+      !raw.includes('@')
+    ) {
       out.add(raw);
     }
   };
@@ -287,6 +396,24 @@ export function extractRecordExtraIdentifiers(rec: IntelRecord): string[] {
     out.add(`${canonicalKey}:${val}`);
   }
   return Array.from(out);
+}
+
+export function hasConflictingDiscordId(
+  rec: IntelRecord,
+  targetDiscordId: string,
+  knownSnowflakes?: string[],
+): boolean {
+  const cleanTarget = targetDiscordId.trim();
+  if (!cleanTarget) return false;
+  const direct = rec.discordId.trim();
+  if (direct && isValidSnowflake(direct)) {
+    return direct !== cleanTarget;
+  }
+  const sfs = knownSnowflakes || extractRecordSnowflakes(rec);
+  if (sfs.length > 0 && !sfs.includes(cleanTarget)) {
+    return true;
+  }
+  return false;
 }
 
 export interface IndexedRecordTokens {
@@ -364,12 +491,15 @@ function recordCompletenessScore(rec: IntelRecord): number {
   if (rec.email) score += 2;
   if (rec.username) score += 1;
   if (rec.ip) score += 1;
-  if (rec.phone) score += 1;
+  if (rec.phone && !isTimestampLikeValue(rec.phone)) score += 1;
   if (rec.source) score += 1;
   if (rec.notes) score += 1;
   score += Math.min(5, Object.keys(rec.extra || {}).length);
   return score;
 }
+
+const MAX_WEAK_KEY_BUCKET = 15;
+const MAX_STRONG_KEY_BUCKET = 50;
 
 export function searchRecords(
   records: IntelRecord[],
@@ -488,7 +618,7 @@ export function searchRecords(
     })
     .sort((a, b) => recordCompletenessScore(b) - recordCompletenessScore(a));
 
-  // Fast O(hops) transitive cross-file correlation via inverted index across ALL identifying attributes
+  // Identity-safe transitive cross-file correlation via inverted index
   const relatedIds = new Set<string>();
   const relatedMatches: IntelRecord[] = [];
 
@@ -506,8 +636,8 @@ export function searchRecords(
   const pendingUsernames = new Set<string>();
   const pendingExtraIds = new Set<string>();
 
-  const queueTokens = (rec: IntelRecord) => {
-    const tokens = poolIndex.tokensByRecordId.get(rec.id) || {
+  const getTokens = (rec: IntelRecord): IndexedRecordTokens =>
+    poolIndex.tokensByRecordId.get(rec.id) || {
       snowflakes: extractRecordSnowflakes(rec),
       emails: extractRecordEmails(rec),
       ips: extractRecordIps(rec),
@@ -515,8 +645,13 @@ export function searchRecords(
       usernames: extractRecordUsernames(rec),
       extraIds: extractRecordExtraIdentifiers(rec),
     };
-    for (const id of tokens.snowflakes) {
-      if (!visitedDiscordIds.has(id)) pendingDiscordIds.add(id);
+
+  const queueTokens = (rec: IntelRecord, options: { allowIp: boolean; allowUsername: boolean; allowDiscordIds: boolean }) => {
+    const tokens = getTokens(rec);
+    if (options.allowDiscordIds) {
+      for (const id of tokens.snowflakes) {
+        if (!visitedDiscordIds.has(id)) pendingDiscordIds.add(id);
+      }
     }
     for (const em of tokens.emails) {
       if (!visitedEmails.has(em)) pendingEmails.add(em);
@@ -524,11 +659,15 @@ export function searchRecords(
     for (const ph of tokens.phones) {
       if (!visitedPhones.has(ph)) pendingPhones.add(ph);
     }
-    for (const ip of tokens.ips) {
-      if (!visitedIps.has(ip)) pendingIps.add(ip);
+    if (options.allowIp) {
+      for (const ip of tokens.ips) {
+        if (isCorrelatableIp(ip) && !visitedIps.has(ip)) pendingIps.add(ip);
+      }
     }
-    for (const un of tokens.usernames) {
-      if (!visitedUsernames.has(un)) pendingUsernames.add(un);
+    if (options.allowUsername) {
+      for (const un of tokens.usernames) {
+        if (!visitedUsernames.has(un)) pendingUsernames.add(un);
+      }
     }
     for (const eid of tokens.extraIds) {
       if (!visitedExtraIds.has(eid)) pendingExtraIds.add(eid);
@@ -536,7 +675,7 @@ export function searchRecords(
   };
 
   for (const rec of primaryMatches) {
-    queueTokens(rec);
+    queueTokens(rec, { allowIp: true, allowUsername: true, allowDiscordIds: true });
   }
   if (detectedType === 'discord_id' && !visitedDiscordIds.has(query)) {
     pendingDiscordIds.add(query);
@@ -545,7 +684,7 @@ export function searchRecords(
   }
 
   let hops = 0;
-  const MAX_HOPS = 10;
+  const MAX_HOPS = 6;
   const MAX_RELATED_CAP = 5000;
 
   while (
@@ -573,43 +712,78 @@ export function searchRecords(
     pendingUsernames.clear();
     pendingExtraIds.clear();
 
-    const candidates: IntelRecord[] = [];
-    const collect = (list: IntelRecord[] | undefined) => {
-      if (!list) return;
-      for (const item of list) candidates.push(item);
+    const strongMap = new Map<string, IntelRecord>();
+    const weakMap = new Map<string, IntelRecord>();
+
+    const collectBounded = (targetMap: Map<string, IntelRecord>, list: IntelRecord[] | undefined, maxBucketSize: number) => {
+      if (!list || list.length === 0) return;
+      if (maxBucketSize > 0 && list.length > maxBucketSize) return;
+      for (const item of list) {
+        targetMap.set(item.id, item);
+      }
     };
 
     for (const id of waveIds) {
       visitedDiscordIds.add(id);
-      collect(poolIndex.byDiscordId.get(id));
+      const isDirectTarget = detectedType !== 'discord_id' || id === query;
+      collectBounded(strongMap, poolIndex.byDiscordId.get(id), isDirectTarget ? 0 : MAX_STRONG_KEY_BUCKET);
     }
     for (const em of waveEmails) {
       visitedEmails.add(em);
-      collect(poolIndex.byEmail.get(em));
+      collectBounded(strongMap, poolIndex.byEmail.get(em), MAX_STRONG_KEY_BUCKET);
     }
     for (const ph of wavePhones) {
       visitedPhones.add(ph);
-      collect(poolIndex.byPhone.get(ph));
-    }
-    for (const ip of waveIps) {
-      visitedIps.add(ip);
-      collect(poolIndex.byIp.get(ip));
-    }
-    for (const un of waveUsernames) {
-      visitedUsernames.add(un);
-      collect(poolIndex.byUsername.get(un));
+      collectBounded(strongMap, poolIndex.byPhone.get(ph), MAX_STRONG_KEY_BUCKET);
     }
     for (const eid of waveExtraIds) {
       visitedExtraIds.add(eid);
-      collect(poolIndex.byExtraIdentifier.get(eid));
+      collectBounded(strongMap, poolIndex.byExtraIdentifier.get(eid), MAX_STRONG_KEY_BUCKET);
+    }
+    // IP & Username are weak contextual join keys: only link if small bucket size
+    for (const ip of waveIps) {
+      visitedIps.add(ip);
+      if (!isCorrelatableIp(ip)) continue;
+      collectBounded(weakMap, poolIndex.byIp.get(ip), MAX_WEAK_KEY_BUCKET);
+    }
+    for (const un of waveUsernames) {
+      visitedUsernames.add(un);
+      collectBounded(weakMap, poolIndex.byUsername.get(un), MAX_WEAK_KEY_BUCKET);
     }
 
-    for (const rec of candidates) {
+    for (const rec of strongMap.values()) {
       if (seenPrimary.has(rec.id) || relatedIds.has(rec.id)) continue;
+      const tokens = getTokens(rec);
+      const hasOtherId = detectedType === 'discord_id' && hasConflictingDiscordId(rec, query, tokens.snowflakes);
+      // Do not propagate conflicting account's IPs or foreign Discord IDs outward
       relatedIds.add(rec.id);
       relatedMatches.push(rec);
-      queueTokens(rec);
+      queueTokens(rec, {
+        allowIp: !hasOtherId,
+        allowUsername: true,
+        allowDiscordIds: !hasOtherId,
+      });
       if (relatedMatches.length >= MAX_RELATED_CAP) break;
+    }
+
+    if (relatedMatches.length < MAX_RELATED_CAP) {
+      for (const rec of weakMap.values()) {
+        if (seenPrimary.has(rec.id) || relatedIds.has(rec.id) || strongMap.has(rec.id)) continue;
+        const tokens = getTokens(rec);
+        // CRITICAL: Never accept a different Discord ID matched only via IP or Username
+        if (detectedType === 'discord_id' && hasConflictingDiscordId(rec, query, tokens.snowflakes)) {
+          continue;
+        }
+        relatedIds.add(rec.id);
+        relatedMatches.push(rec);
+        // Never chain IP -> another IP or weak-match usernames -> new IPs
+        queueTokens(rec, {
+          allowIp: false,
+          allowUsername: false,
+          allowDiscordIds: false,
+        });
+        if (relatedMatches.length >= MAX_RELATED_CAP) break;
+      }
     }
   }
 
@@ -745,4 +919,36 @@ export function maskPhone(phone: string): string {
   const clean = phone.trim();
   if (clean.length <= 4) return '****';
   return clean.slice(0, 3) + '*'.repeat(Math.max(2, clean.length - 5)) + clean.slice(-2);
+}
+
+const FILENAME_LIKE_SOURCE_RE =
+  /^(?:data[-_\s]*(?:part)?[-_\s]*\d+|.*\.(?:csv|txt|json|ndjson|jsonl|sql|log))$/i;
+
+export function sanitizeQuerySource(source: string, datasetName: string): string {
+  const s = (source || '').trim();
+  if (!s) return '';
+  if (datasetName && s.toLowerCase() === datasetName.trim().toLowerCase()) return '';
+  if (FILENAME_LIKE_SOURCE_RE.test(s)) return '';
+  return s;
+}
+
+export function sanitizeRecordsForQueryResponse(records: IntelRecord[]): IntelRecord[] {
+  return records.map((r) => {
+    const dbType = classifyRecordDatabaseType(r);
+    const rawPhone = (r.phone || '').trim();
+    const phoneIsTimestamp = isTimestampLikeValue(rawPhone);
+    let extra = r.extra || {};
+    if (phoneIsTimestamp && !Object.values(extra).some((v) => String(v || '').trim() === rawPhone)) {
+      extra = { ...extra, tarih: rawPhone };
+    }
+    return {
+      ...r,
+      dbType,
+      datasetId: '',
+      datasetName: '',
+      source: sanitizeQuerySource(r.source, r.datasetName),
+      phone: phoneIsTimestamp ? '' : r.phone,
+      extra,
+    };
+  });
 }

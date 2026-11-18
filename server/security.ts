@@ -7,6 +7,7 @@ export interface RateLimitOptions {
   keyPrefix: string;
   message?: string;
   violationWeight?: number;
+  keyGenerator?: (req: Request) => string;
 }
 
 interface RateBucket {
@@ -22,9 +23,21 @@ interface IpViolationState {
 const buckets = new Map<string, RateBucket>();
 const ipViolations = new Map<string, IpViolationState>();
 
+const MAX_TRACKED_ENTRIES = 50_000;
 const VIOLATION_WINDOW_MS = 10 * 60 * 1000;
 const VIOLATION_THRESHOLD = 8;
 const IP_BLOCK_DURATION_MS = 20 * 60 * 1000;
+
+function trimMapOverflow<K, V>(map: Map<K, V>) {
+  if (map.size <= MAX_TRACKED_ENTRIES) return;
+  const excess = map.size - Math.floor(MAX_TRACKED_ENTRIES * 0.9);
+  let removed = 0;
+  for (const key of map.keys()) {
+    map.delete(key);
+    removed += 1;
+    if (removed >= excess) break;
+  }
+}
 
 // Periodically prune expired buckets and IP blocks to prevent memory exhaustion under DDoS
 setInterval(() => {
@@ -94,13 +107,15 @@ export function isIpTemporarilyBlocked(ip: string): { blocked: boolean; retryAft
 }
 
 export function recordIpViolation(ip: string, weight = 1) {
+  if (weight <= 0) return;
   const now = Date.now();
   let state = ipViolations.get(ip);
   if (!state || now - state.windowStart > VIOLATION_WINDOW_MS) {
     state = { score: 0, windowStart: now, blockedUntil: 0 };
     ipViolations.set(ip, state);
+    trimMapOverflow(ipViolations);
   }
-  state.score += Math.max(1, weight);
+  state.score += weight;
   if (state.score >= VIOLATION_THRESHOLD) {
     state.blockedUntil = now + IP_BLOCK_DURATION_MS;
   }
@@ -123,7 +138,8 @@ export function ipShieldMiddleware(req: Request, res: Response, next: NextFuncti
 export function createRateLimiter(options: RateLimitOptions) {
   return (req: Request, res: Response, next: NextFunction) => {
     const ip = getClientIp(req);
-    const key = `${options.keyPrefix}:${ip}`;
+    const subject = options.keyGenerator ? options.keyGenerator(req) : ip;
+    const key = `${options.keyPrefix}:${subject}`;
     const now = Date.now();
     const cutoff = now - options.windowMs;
 
@@ -131,12 +147,16 @@ export function createRateLimiter(options: RateLimitOptions) {
     if (!bucket) {
       bucket = { timestamps: [] };
       buckets.set(key, bucket);
+      trimMapOverflow(buckets);
     }
 
     bucket.timestamps = bucket.timestamps.filter((ts) => ts > cutoff);
 
     if (bucket.timestamps.length >= options.maxRequests) {
-      recordIpViolation(ip, options.violationWeight ?? 1);
+      const weight = options.violationWeight ?? 1;
+      if (weight > 0) {
+        recordIpViolation(ip, weight);
+      }
       const oldest = bucket.timestamps[0];
       const retryAfterSec = Math.max(1, Math.ceil((oldest + options.windowMs - now) / 1000));
       res.setHeader('Retry-After', String(retryAfterSec));
@@ -209,6 +229,14 @@ export function hashPassword(password: string): string {
   return `${salt}:${derived}`;
 }
 
+export async function hashPasswordAsync(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = await new Promise<Buffer>((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, (err, key) => (err ? reject(err) : resolve(key)));
+  });
+  return `${salt}:${derived.toString('hex')}`;
+}
+
 export function verifyPassword(password: string, storedHash: string): boolean {
   const parts = storedHash.split(':');
   if (parts.length !== 2) return false;
@@ -217,6 +245,23 @@ export function verifyPassword(password: string, storedHash: string): boolean {
   try {
     const expected = Buffer.from(keyHex, 'hex');
     const actual = crypto.scryptSync(password, salt, 64);
+    if (expected.length !== actual.length) return false;
+    return crypto.timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+export async function verifyPasswordAsync(password: string, storedHash: string): Promise<boolean> {
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, keyHex] = parts;
+  if (!salt || !keyHex) return false;
+  try {
+    const expected = Buffer.from(keyHex, 'hex');
+    const actual = await new Promise<Buffer>((resolve, reject) => {
+      crypto.scrypt(password, salt, 64, (err, key) => (err ? reject(err) : resolve(key)));
+    });
     if (expected.length !== actual.length) return false;
     return crypto.timingSafeEqual(expected, actual);
   } catch {

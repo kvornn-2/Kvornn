@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  createRateLimiter,
   generateThirtyDigitKey,
   getClientIp,
   hashAdminKey,
@@ -21,7 +22,8 @@ import {
 } from './security.ts';
 import { checkDisposableEmail, isDomainInDisposableBlocklist } from './disposable.ts';
 import { ServerStore } from './store.ts';
-import type { Request } from 'express';
+import { sanitizeRecordsForQueryResponse } from '../src/utils/search.ts';
+import type { Request, Response } from 'express';
 
 test('30-digit admin key generator and verifier enforce strict format and timing-safe match', () => {
   const key = generateThirtyDigitKey();
@@ -557,6 +559,129 @@ test('Raw chunked upload + background DiskIndex analysis correlates across memor
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Async scrypt auth, shared-IP per-user rate limiter, parallel disk queries, and debounced flush hold up concurrently', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentarika-conc-'));
+  try {
+    const store = new ServerStore(tmpDir);
+
+    // 1. Concurrent async registrations + logins
+    const users = await Promise.all(
+      Array.from({ length: 6 }, (_, i) =>
+        store.registerUserDirectAsync(
+          `conc${i}@gmail.com`,
+          `conc_user_${i}`,
+          'StrongPass!2026',
+          '198.51.100.77',
+          `uid_conc_${i}`,
+        ),
+      ),
+    );
+    assert.equal(users.length, 6);
+
+    const authResults = await Promise.all(
+      users.map((u) => store.authenticateUserAsync(u.username, 'StrongPass!2026', '198.51.100.77')),
+    );
+    assert.equal(authResults.every((r) => Boolean(r?.user?.id)), true);
+
+    // 2. Shared NAT IP with violationWeight: 0 + keyGenerator isolates users and never bans shared IP
+    const sharedNatIp = '198.51.100.99';
+    const userScopedLimiter = createRateLimiter({
+      windowMs: 60_000,
+      maxRequests: 2,
+      keyPrefix: 'conc-test',
+      violationWeight: 0,
+      keyGenerator: (req) => String((req.headers['x-test-user'] as string) || getClientIp(req)),
+    });
+
+    const invokeLimiter = (userKey: string): Promise<number> =>
+      new Promise((resolve) => {
+        let status = 200;
+        const req = {
+          ip: sharedNatIp,
+          headers: { 'x-test-user': userKey },
+          socket: { remoteAddress: sharedNatIp },
+        } as unknown as Request;
+        const res = {
+          setHeader() {},
+          status(code: number) {
+            status = code;
+            return this;
+          },
+          json() {
+            resolve(status);
+            return this;
+          },
+        } as unknown as Response;
+        userScopedLimiter(req, res, () => resolve(200));
+      });
+
+    assert.equal(await invokeLimiter('userA'), 200);
+    assert.equal(await invokeLimiter('userA'), 200);
+    assert.equal(await invokeLimiter('userA'), 429);
+    assert.equal(await invokeLimiter('userB'), 200);
+    assert.equal(isIpTemporarilyBlocked(sharedNatIp).blocked, false);
+
+    // 3. Seed disk dataset and run 15 parallel async lookups + quota writes + flush
+    const rawBuf = Buffer.from(
+      '104567890123456789:target.conc@example.test:conc_target\n289104567890123456:other.conc@example.test:conc_other\n',
+      'utf8',
+    );
+    store.initRawUploadDataset({
+      id: 'ds_conc_disk',
+      name: 'ConcDisk',
+      format: 'text',
+      sizeBytes: rawBuf.length,
+      columns: ['discordId', 'email', 'username'],
+      mapping: {
+        discordIdField: 'discordId',
+        emailField: 'email',
+        usernameField: 'username',
+        sourceField: null,
+        ipField: null,
+        phoneField: null,
+        notesField: null,
+      },
+    });
+    store.appendRawUploadChunk('ds_conc_disk', rawBuf, 0);
+    store.startBackgroundIngestion('ds_conc_disk', { delimiter: ':', hasHeader: false, isHeterogeneous: false });
+
+    for (let i = 0; i < 60; i++) {
+      const cur = store.getDatasetById('ds_conc_disk');
+      if (cur?.ingestionStatus === 'ready') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const searches = await Promise.all(
+      Array.from({ length: 15 }, (_, idx) => {
+        store.consumeQueryQuota(users[idx % users.length].id);
+        store.appendQueryAuditLog({
+          userId: users[idx % users.length].id,
+          username: users[idx % users.length].username,
+          queryType: 'id_lookup',
+          target: '104567890123456789',
+          matchCount: 1,
+          ip: sharedNatIp,
+        });
+        return store.searchAcrossAllStoresAsync('104567890123456789', 'discord_id', true);
+      }),
+    );
+
+    assert.equal(searches.every((s) => s.primaryMatches.length === 1), true);
+    await store.flushPendingWrites();
+
+    const reloaded = new ServerStore(tmpDir);
+    assert.equal(reloaded.getUsersCount(), 6);
+    assert.equal(reloaded.getQueryAuditLogs().length, 15);
+    assert.equal(
+      reloaded.listAllUsersForAdmin().reduce((acc, u) => acc + u.dailyUsed, 0),
+      15,
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 
 

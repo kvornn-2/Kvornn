@@ -270,7 +270,12 @@ export interface DisposableCheckResult {
   reason?: string;
 }
 
+const MAX_DOMAIN_CACHE = 10_000;
 const domainCache = new Map<string, { expiresAt: number; isDisposable: boolean; detector: DisposableDetector }>();
+const inflightDomainChecks = new Map<
+  string,
+  Promise<{ isDisposable: boolean; detector: DisposableDetector } | null>
+>();
 
 export function isDomainInDisposableBlocklist(domain: string): boolean {
   const clean = domain.trim().toLowerCase();
@@ -293,37 +298,55 @@ async function checkRemoteDisposableApis(
     return { isDisposable: cached.isDisposable, detector: cached.detector };
   }
 
-  const [debounceRes, kickboxRes] = await Promise.all([
-    fetch(`https://disposable.debounce.io/?email=${encodeURIComponent(email)}`, {
-      signal: AbortSignal.timeout(2600),
-    })
-      .then((r) => (r.ok ? (r.json() as Promise<{ disposable?: string | boolean }>) : null))
-      .catch(() => null),
-    fetch(`https://open.kickbox.com/v1/disposable/${encodeURIComponent(domain)}`, {
-      signal: AbortSignal.timeout(2600),
-    })
-      .then((r) => (r.ok ? (r.json() as Promise<{ disposable?: boolean }>) : null))
-      .catch(() => null),
-  ]);
-
-  let isDisposable = false;
-  let detector: DisposableDetector = 'clean';
-
-  if (debounceRes && (debounceRes.disposable === true || debounceRes.disposable === 'true')) {
-    isDisposable = true;
-    detector = 'debounce-api';
-  } else if (kickboxRes && kickboxRes.disposable === true) {
-    isDisposable = true;
-    detector = 'kickbox-api';
+  const inflight = inflightDomainChecks.get(domain);
+  if (inflight) {
+    return inflight;
   }
 
-  domainCache.set(domain, {
-    expiresAt: Date.now() + 10 * 60 * 1000,
-    isDisposable,
-    detector,
-  });
+  const run = (async () => {
+    try {
+      const [debounceRes, kickboxRes] = await Promise.all([
+        fetch(`https://disposable.debounce.io/?email=${encodeURIComponent(email)}`, {
+          signal: AbortSignal.timeout(2600),
+        })
+          .then((r) => (r.ok ? (r.json() as Promise<{ disposable?: string | boolean }>) : null))
+          .catch(() => null),
+        fetch(`https://open.kickbox.com/v1/disposable/${encodeURIComponent(domain)}`, {
+          signal: AbortSignal.timeout(2600),
+        })
+          .then((r) => (r.ok ? (r.json() as Promise<{ disposable?: boolean }>) : null))
+          .catch(() => null),
+      ]);
 
-  return { isDisposable, detector };
+      let isDisposable = false;
+      let detector: DisposableDetector = 'clean';
+
+      if (debounceRes && (debounceRes.disposable === true || debounceRes.disposable === 'true')) {
+        isDisposable = true;
+        detector = 'debounce-api';
+      } else if (kickboxRes && kickboxRes.disposable === true) {
+        isDisposable = true;
+        detector = 'kickbox-api';
+      }
+
+      if (domainCache.size >= MAX_DOMAIN_CACHE) {
+        const oldestKey = domainCache.keys().next().value;
+        if (oldestKey !== undefined) domainCache.delete(oldestKey);
+      }
+      domainCache.set(domain, {
+        expiresAt: Date.now() + 10 * 60 * 1000,
+        isDisposable,
+        detector,
+      });
+
+      return { isDisposable, detector };
+    } finally {
+      inflightDomainChecks.delete(domain);
+    }
+  })();
+
+  inflightDomainChecks.set(domain, run);
+  return run;
 }
 
 export async function checkDisposableEmail(

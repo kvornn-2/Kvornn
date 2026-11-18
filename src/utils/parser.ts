@@ -184,15 +184,24 @@ function isLikelyHeaderRow(cells: string[]): boolean {
   return lowered.some((c) => knownHeaders.has(c));
 }
 
+const DATE_OR_DATETIME_RE =
+  /^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T\s]+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?$|^\d{1,2}[-/.]\d{1,2}[-/.]\d{4}(?:[T\s]+\d{1,2}:\d{2}(?::\d{2})?)?$/;
+
+const NON_PHONE_COL_RE =
+  /^(id|uid|user_id|userid|discord_id|ip|ip_address|registration_ip|last_ip|login_ip|ip2|last_login|created_at|updated_at|registered_at|last_seen|timestamp|date|time|tarih|kayit_tarihi|son_giris|expires_at|created|updated|hash|avatar_hash|token|password|pass)$/i;
+
 export function isValidPhoneCandidate(raw: string): boolean {
   const trimmed = raw.trim();
   if (!trimmed) return false;
+  if (trimmed.includes(':')) return false;
+  if (DATE_OR_DATETIME_RE.test(trimmed)) return false;
   const digits = trimmed.replace(/\D/g, '');
   if (digits.length < 9 || digits.length > 15) return false;
   if (IPV4_INLINE_RE.test(trimmed)) return false;
   if (isValidSnowflake(digits)) return false;
-  // Reject dotted/dashed date strings like 2024-05-12
-  if (/^\d{4}[-/.]\d{2}[-/.]\d{2}$/.test(trimmed)) return false;
+  // Reject obvious repeating or sequential dummy digits (e.g. 123456789, 000000000)
+  if (/^(\d)\1{6,}$/.test(digits)) return false;
+  if ('0123456789012345'.includes(digits) || '9876543210987654'.includes(digits)) return false;
   return true;
 }
 
@@ -495,6 +504,8 @@ function parseMixedSingleLine(line: string): Record<string, string> {
         } else if (!resolvedPhone) {
           for (const [fk, fv] of Object.entries(flat)) {
             if (usedKeys.has(fk)) continue;
+            const leafKey = (fk.split('.').pop() || fk).toLowerCase().replace(/[\s-]+/g, '_');
+            if (NON_PHONE_COL_RE.test(leafKey)) continue;
             const matches = fv.match(PHONE_CANDIDATE_RE) || [];
             const hit = matches.find((cand) => isValidPhoneCandidate(cand));
             if (hit) {
@@ -1179,8 +1190,12 @@ export function normalizeSingleRow(
   }
   if (!phone) {
     for (const [k, val] of Object.entries(row)) {
-      if (k === mapping.discordIdField || k === mapping.ipField) continue;
-      const candidates = (val || '').match(PHONE_CANDIDATE_RE) || [];
+      if (k === mapping.discordIdField || k === mapping.ipField || k === mapping.emailField) continue;
+      const normCol = (k.split('.').pop() || k).toLowerCase().replace(/[\s-]+/g, '_');
+      if (NON_PHONE_COL_RE.test(normCol)) continue;
+      const trimmedVal = (val || '').trim();
+      if (!trimmedVal || DATE_OR_DATETIME_RE.test(trimmedVal) || trimmedVal.includes(':')) continue;
+      const candidates = trimmedVal.match(PHONE_CANDIDATE_RE) || [];
       const hit = candidates.find((c) => isValidPhoneCandidate(c));
       if (hit) {
         phone = hit.trim();
