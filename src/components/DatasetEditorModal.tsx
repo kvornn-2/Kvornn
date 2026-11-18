@@ -138,7 +138,7 @@ export function DatasetEditorModal({ dataset, onClose, onDatasetChanged }: Datas
       const res = await apiAdminUpdateDataset(meta.id, {
         name: nameInput.trim() || meta.name,
         mapping,
-        reNormalize: true,
+        reNormalize: meta.storageMode !== 'disk',
       });
       setMeta(res.dataset);
       setNameInput(res.dataset.name);

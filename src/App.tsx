@@ -440,6 +440,10 @@ function AppShell() {
             open={importOpen}
             onClose={() => setImportOpen(false)}
             onImportComplete={handleImportComplete}
+            onRawUploadStarted={(_dataset, nextStats) => {
+              setStats(nextStats);
+              setDatasetRevision((r) => r + 1);
+            }}
           />
         </Suspense>
       )}

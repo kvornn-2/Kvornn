@@ -265,6 +265,105 @@ export async function apiAppendDatasetBatch(
   });
 }
 
+export async function apiAdminUploadInit(payload: {
+  id?: string;
+  name: string;
+  format: DatasetMeta['format'];
+  sizeBytes: number;
+  columns: string[];
+  mapping: import('../types/intel').FieldMapping;
+}): Promise<{ dataset: DatasetMeta; stats: { totalDatasets: number; totalRecords: number; totalUsers: number } }> {
+  return apiRequest('/api/admin/upload/init', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function apiAdminUploadChunk(
+  datasetId: string,
+  chunk: Blob,
+  offset: number,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; receivedBytes: number }> {
+  const token = getStoredToken();
+  const maxAttempts = 4;
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) {
+      throw new ApiError('Yükleme iptal edildi.', 499, {});
+    }
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/octet-stream',
+        'X-Chunk-Offset': String(offset),
+      };
+      if (token) headers.Authorization = `Bearer ${token}`;
+
+      const res = await nativeFetch(
+        `/api/admin/upload/${encodeURIComponent(datasetId)}/chunk?offset=${offset}`,
+        {
+          method: 'POST',
+          headers,
+          body: chunk,
+          cache: 'no-store',
+          signal,
+        },
+      );
+
+      if (res.ok) {
+        return (await res.json()) as { ok: boolean; receivedBytes: number };
+      }
+
+      const data = (await res.json().catch(() => ({}))) as { error?: string } & Record<string, unknown>;
+      if (res.status < 500 && res.status !== 429) {
+        throw new ApiError(data.error || `Parça aktarımı başarısız (HTTP ${res.status}).`, res.status, data);
+      }
+      lastError = new ApiError(data.error || `Sunucu geçici hatası (HTTP ${res.status}).`, res.status, data);
+    } catch (err) {
+      if (err instanceof ApiError && err.status < 500 && err.status !== 429) {
+        throw err;
+      }
+      if (signal?.aborted) {
+        throw new ApiError('Yükleme iptal edildi.', 499, {});
+      }
+      lastError = err instanceof Error ? err : new Error('Ağ bağlantısı kesildi.');
+    }
+
+    if (attempt < maxAttempts - 1) {
+      const delayMs = 450 * Math.pow(2, attempt);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw lastError || new ApiError('Parça sunucuya aktarılamadı.', 503, {});
+}
+
+export async function apiAdminUploadComplete(
+  datasetId: string,
+  options: {
+    delimiter?: string;
+    hasHeader?: boolean;
+    isHeterogeneous?: boolean;
+    mapping?: import('../types/intel').FieldMapping;
+  } = {},
+): Promise<{ dataset: DatasetMeta; stats: { totalDatasets: number; totalRecords: number; totalUsers: number } }> {
+  return apiRequest(`/api/admin/upload/${encodeURIComponent(datasetId)}/complete`, {
+    method: 'POST',
+    body: JSON.stringify(options),
+  });
+}
+
+export async function apiAdminUploadAbort(datasetId: string): Promise<void> {
+  try {
+    await apiRequest(`/api/admin/upload/${encodeURIComponent(datasetId)}`, {
+      method: 'DELETE',
+    });
+  } catch {
+    // Best-effort abort cleanup
+  }
+}
+
 export async function apiLoadSyntheticDataset(): Promise<{
   dataset: DatasetMeta;
   stats: { totalDatasets: number; totalRecords: number; totalUsers: number };

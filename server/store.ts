@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import type {
   AdminUserRow,
   BlockedRegistrationAttempt,
+  BulkQueryRow,
   DatasetCategory,
   DatasetMeta,
   FieldMapping,
@@ -11,20 +12,35 @@ import type {
   PublicUser,
   QueryAuditLog,
   QueryBlacklist,
+  QuerySearchMode,
   RoleConfigMap,
   RolePermissions,
+  SearchResult,
   StandardRole,
   UserRole,
 } from '../src/types/intel.ts';
 import { reNormalizeDatasetRecords } from '../src/utils/parser.ts';
 import {
   buildSearchIndex,
+  classifyRecordDatabaseType,
+  detectQueryType,
   extractRecordEmails,
+  extractRecordExtraIdentifiers,
+  extractRecordIps,
+  extractRecordPhones,
   extractRecordSnowflakes,
+  extractRecordUsernames,
   filterDatabaseRecords,
+  searchRecords,
   type SearchIndex,
 } from '../src/utils/search.ts';
-import { isValidSnowflake } from '../src/utils/snowflake.ts';
+import { decodeSnowflake, isValidSnowflake } from '../src/utils/snowflake.ts';
+import {
+  analyzeRawFileToDiskDataset,
+  DiskIndex,
+  indexRecordBatchToDisk,
+  iterateShardRecordsSync,
+} from './diskIndex.ts';
 import {
   hashAdminKey,
   hashPassword,
@@ -232,6 +248,8 @@ export class ServerStore {
   private blacklistedEmails = new Set<string>();
   private deletedDatasetIds = new Set<string>();
   private searchIndex: SearchIndex | null = null;
+  private readonly diskIndex: DiskIndex;
+  private readonly activeIngestions = new Map<string, AbortController>();
   private secrets!: SecuritySecrets;
   private adminDailyUsed = 0;
   private adminUsageDate = todayKey();
@@ -249,6 +267,7 @@ export class ServerStore {
     this.blacklistFile = path.join(this.dataDir, 'blacklist.json');
 
     ensureDir(this.dataDir);
+    this.diskIndex = new DiskIndex(this.dataDir);
     this.initSecrets();
     this.users = readJsonFile<StoredUser[]>(this.usersFile, []);
     this.roles = readJsonFile<RoleConfigMap>(this.rolesFile, structuredClone(DEFAULT_ROLES));
@@ -282,18 +301,50 @@ export class ServerStore {
     return path.join(this.dataDir, `ds_${sanitizeShardName(datasetId)}.ndjson`);
   }
 
+  private getRawUploadPath(datasetId: string): string {
+    return path.join(this.dataDir, `raw_${sanitizeShardName(datasetId)}.dat`);
+  }
+
   private loadAllRecords() {
     const loaded: IntelRecord[] = [];
     let migratedFromLegacy = false;
+    const MEMORY_SHARD_MAX_BYTES = 32 * 1024 * 1024;
+    let datasetsMetaUpdated = false;
 
     for (const ds of this.datasets) {
+      if (ds.ingestionStatus === 'uploading' || ds.ingestionStatus === 'analyzing') {
+        const shardPath = this.getDatasetShardPath(ds.id);
+        if (fs.existsSync(shardPath) && ds.recordCount > 0) {
+          ds.ingestionStatus = 'ready';
+        } else {
+          ds.ingestionStatus = 'error';
+          ds.ingestionError = 'Sunucu yeniden başlatıldığı için aktarım kesintiye uğradı; lütfen dosyayı tekrar yükleyin.';
+        }
+        datasetsMetaUpdated = true;
+      }
+
       const shardPath = this.getDatasetShardPath(ds.id);
+      if (ds.storageMode === 'disk') {
+        // Keep disk-backed mega datasets off the V8 heap; served via DiskIndex
+        continue;
+      }
       if (fs.existsSync(shardPath)) {
+        const stat = fs.statSync(shardPath);
+        if (stat.size > MEMORY_SHARD_MAX_BYTES) {
+          ds.storageMode = 'disk';
+          ds.ingestionStatus = ds.ingestionStatus || 'ready';
+          datasetsMetaUpdated = true;
+          continue;
+        }
         const shardRecs = readNdjsonRecords(shardPath);
         for (let i = 0; i < shardRecs.length; i++) {
           loaded.push(shardRecs[i]);
         }
       }
+    }
+
+    if (datasetsMetaUpdated) {
+      writeJsonFile(this.datasetsFile, this.datasets);
     }
 
     // Backwards-compatible migration from monolithic data/records.json if present
@@ -689,9 +740,10 @@ export class ServerStore {
   }
 
   getStats(): { totalDatasets: number; totalRecords: number; totalUsers: number } {
+    const datasetRecordSum = this.datasets.reduce((sum, d) => sum + (d.recordCount || 0), 0);
     return {
       totalDatasets: this.datasets.length,
-      totalRecords: this.records.length,
+      totalRecords: Math.max(this.records.length, datasetRecordSum),
       totalUsers: this.users.length,
     };
   }
@@ -732,15 +784,520 @@ export class ServerStore {
   ): { meta: DatasetMeta | null; total: number; records: IntelRecord[] } {
     const meta = this.getDatasetById(datasetId);
     if (!meta) return { meta: null, total: 0, records: [] };
-    const matched = filterDatabaseRecords(this.records, rawSearch, datasetId);
     const safeLimit = Math.max(1, Math.min(200, limit));
     const safePage = Math.max(1, page);
     const start = (safePage - 1) * safeLimit;
+
+    if (meta.storageMode === 'disk') {
+      const shardPath = this.getDatasetShardPath(datasetId);
+      const q = rawSearch.trim();
+      const pageRecords: IntelRecord[] = [];
+      let total = 0;
+
+      iterateShardRecordsSync(shardPath, (rec) => {
+        if (q && filterDatabaseRecords([rec], q).length === 0) {
+          return;
+        }
+        if (total >= start && pageRecords.length < safeLimit) {
+          pageRecords.push(rec);
+        }
+        total += 1;
+        if (!q && pageRecords.length >= safeLimit) {
+          total = Math.max(total, meta.recordCount);
+          return false;
+        }
+      });
+
+      return { meta, total, records: pageRecords };
+    }
+
+    const matched = filterDatabaseRecords(this.records, rawSearch, datasetId);
     return {
       meta,
       total: matched.length,
       records: matched.slice(start, start + safeLimit),
     };
+  }
+
+  filterDatabaseRecordsAcrossAll(
+    rawSearch: string,
+    datasetId?: string,
+    maxRecords = 200,
+  ): { total: number; records: IntelRecord[] } {
+    const results: IntelRecord[] = [];
+    let total = 0;
+    const q = rawSearch.trim();
+
+    if (!datasetId || this.getDatasetById(datasetId)?.storageMode !== 'disk') {
+      const memMatched = filterDatabaseRecords(this.records, q, datasetId);
+      total += memMatched.length;
+      for (let i = 0; i < memMatched.length && results.length < maxRecords; i++) {
+        results.push(memMatched[i]);
+      }
+    }
+
+    const diskDatasets = this.datasets.filter(
+      (d) => d.storageMode === 'disk' && (!datasetId || d.id === datasetId),
+    );
+    for (const ds of diskDatasets) {
+      const shardPath = this.getDatasetShardPath(ds.id);
+      if (!q && results.length >= maxRecords) {
+        total += ds.recordCount;
+        continue;
+      }
+      let matchedInShard = 0;
+      iterateShardRecordsSync(shardPath, (rec) => {
+        if (!q || filterDatabaseRecords([rec], q).length > 0) {
+          matchedInShard += 1;
+          if (results.length < maxRecords) {
+            results.push(rec);
+          } else if (!q) {
+            matchedInShard = ds.recordCount;
+            return false;
+          }
+        }
+      });
+      total += matchedInShard;
+    }
+
+    return { total, records: results };
+  }
+
+  iterateExportRecords(
+    opts: { datasetId?: string; q?: string },
+    onRecord: (rec: IntelRecord) => void,
+  ) {
+    const q = (opts.q || '').trim();
+    const targetDs = opts.datasetId ? this.getDatasetById(opts.datasetId) : null;
+
+    if (!targetDs || targetDs.storageMode !== 'disk') {
+      const memMatched = filterDatabaseRecords(this.records, q, opts.datasetId);
+      for (let i = 0; i < memMatched.length; i++) {
+        onRecord(memMatched[i]);
+      }
+    }
+
+    const diskDatasets = this.datasets.filter(
+      (d) => d.storageMode === 'disk' && (!opts.datasetId || d.id === opts.datasetId),
+    );
+    for (const ds of diskDatasets) {
+      const shardPath = this.getDatasetShardPath(ds.id);
+      iterateShardRecordsSync(shardPath, (rec) => {
+        if (!q || filterDatabaseRecords([rec], q).length > 0) {
+          onRecord(rec);
+        }
+      });
+    }
+  }
+
+  getSampleRecordsForAdmin(limit = 150): IntelRecord[] {
+    if (this.records.length > 0) {
+      return this.records.slice(0, limit);
+    }
+    const sample: IntelRecord[] = [];
+    for (const ds of this.datasets) {
+      if (ds.storageMode !== 'disk') continue;
+      iterateShardRecordsSync(this.getDatasetShardPath(ds.id), (rec) => {
+        sample.push(rec);
+        if (sample.length >= limit) return false;
+      });
+      if (sample.length >= limit) break;
+    }
+    return sample;
+  }
+
+  initRawUploadDataset(params: {
+    id?: string;
+    name: string;
+    format: DatasetMeta['format'];
+    sizeBytes: number;
+    columns: string[];
+    mapping: FieldMapping;
+  }): DatasetMeta {
+    const id = params.id || `ds_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    this.deletedDatasetIds.delete(id);
+    this.datasets = this.datasets.filter((d) => d.id !== id);
+    const meta: DatasetMeta = {
+      id,
+      name: params.name,
+      category: 'both',
+      format: params.format,
+      recordCount: 0,
+      columns: params.columns.slice(0, 50),
+      mapping: params.mapping,
+      importedAt: new Date().toISOString(),
+      sizeBytes: Math.max(0, params.sizeBytes || 0),
+      storageMode: 'disk',
+      ingestionStatus: 'uploading',
+    };
+
+    const rawPath = this.getRawUploadPath(id);
+    ensureDir(path.dirname(rawPath));
+    fs.writeFileSync(rawPath, Buffer.alloc(0));
+
+    this.datasets.unshift(meta);
+    writeJsonFile(this.datasetsFile, this.datasets);
+    return meta;
+  }
+
+  appendRawUploadChunk(datasetId: string, chunk: Buffer, offset?: number): number {
+    const ds = this.getDatasetById(datasetId);
+    if (!ds) throw new Error('Yükleme oturumu bulunamadı.');
+    const rawPath = this.getRawUploadPath(datasetId);
+    ensureDir(path.dirname(rawPath));
+    if (typeof offset === 'number' && Number.isFinite(offset) && offset >= 0) {
+      if (!fs.existsSync(rawPath)) {
+        fs.writeFileSync(rawPath, Buffer.alloc(0));
+      }
+      const fd = fs.openSync(rawPath, 'r+');
+      try {
+        fs.writeSync(fd, chunk, 0, chunk.length, offset);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      fs.appendFileSync(rawPath, chunk);
+    }
+    const currentSize = fs.statSync(rawPath).size;
+    if (currentSize > ds.sizeBytes) {
+      ds.sizeBytes = currentSize;
+    }
+    return currentSize;
+  }
+
+  startBackgroundIngestion(
+    datasetId: string,
+    options: {
+      delimiter?: string;
+      hasHeader?: boolean;
+      isHeterogeneous?: boolean;
+      mapping?: FieldMapping;
+    } = {},
+  ): DatasetMeta {
+    const ds = this.getDatasetById(datasetId);
+    if (!ds) throw new Error('Veri deposu bulunamadı.');
+
+    if (options.mapping) {
+      ds.mapping = options.mapping;
+    }
+    ds.storageMode = 'disk';
+    ds.ingestionStatus = 'analyzing';
+    ds.ingestionError = undefined;
+    const rawPath = this.getRawUploadPath(datasetId);
+    if (fs.existsSync(rawPath)) {
+      const actualBytes = fs.statSync(rawPath).size;
+      if (actualBytes > 0) ds.sizeBytes = actualBytes;
+    }
+    writeJsonFile(this.datasetsFile, this.datasets);
+
+    const existingCtrl = this.activeIngestions.get(datasetId);
+    if (existingCtrl) {
+      existingCtrl.abort();
+    }
+    const controller = new AbortController();
+    this.activeIngestions.set(datasetId, controller);
+
+    const shardPath = this.getDatasetShardPath(datasetId);
+    const ingestionFormat: 'json' | 'csv' | 'ndjson' | 'text' =
+      ds.format === 'synthetic' ? 'text' : ds.format;
+
+    void analyzeRawFileToDiskDataset({
+      datasetId,
+      datasetName: ds.name,
+      rawFilePath: rawPath,
+      shardPath,
+      format: ingestionFormat,
+      columns: ds.columns,
+      mapping: ds.mapping,
+      delimiter: options.delimiter,
+      hasHeader: options.hasHeader,
+      isHeterogeneous: options.isHeterogeneous,
+      diskIndex: this.diskIndex,
+      signal: controller.signal,
+      onProgress: (processedCount) => {
+        const live = this.getDatasetById(datasetId);
+        if (!live || controller.signal.aborted) return;
+        live.recordCount = processedCount;
+        writeJsonFile(this.datasetsFile, this.datasets);
+      },
+    })
+      .then((res) => {
+        if (controller.signal.aborted) return;
+        const live = this.getDatasetById(datasetId);
+        if (live) {
+          live.recordCount = res.recordCount;
+          live.columns = res.columns;
+          live.ingestionStatus = 'ready';
+          live.storageMode = 'disk';
+          if (live.sizeBytes <= 0) live.sizeBytes = res.shardBytes;
+          writeJsonFile(this.datasetsFile, this.datasets);
+        }
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        const live = this.getDatasetById(datasetId);
+        if (live) {
+          live.ingestionStatus = 'error';
+          live.ingestionError = err instanceof Error ? err.message : 'Veri analizi başarısız oldu.';
+          writeJsonFile(this.datasetsFile, this.datasets);
+        }
+      })
+      .finally(() => {
+        if (this.activeIngestions.get(datasetId) === controller) {
+          this.activeIngestions.delete(datasetId);
+        }
+        try {
+          if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
+        } catch {
+          // Ignore cleanup errors
+        }
+      });
+
+    return ds;
+  }
+
+  searchAcrossAllStores(
+    rawQuery: string,
+    mode: QuerySearchMode = 'auto',
+    exactMatch = true,
+  ): SearchResult {
+    const started = performance.now();
+    const query = rawQuery.trim();
+    const detectedType = detectQueryType(query, mode);
+    const snowflake = isValidSnowflake(query) ? decodeSnowflake(query) : null;
+    const stats = this.getStats();
+
+    if (!query) {
+      return {
+        query: '',
+        detectedType,
+        snowflake: null,
+        primaryMatches: [],
+        relatedMatches: [],
+        durationMs: 0,
+        scanMetrics: {
+          scannedRecords: stats.totalRecords,
+          scannedDatasets: stats.totalDatasets,
+          scannedBytes: this.getTotalDataBytes(),
+        },
+      };
+    }
+
+    const memIndex = this.getSearchIndex();
+    const memRes = searchRecords(this.records, query, mode, exactMatch, this.records, memIndex);
+
+    const diskDatasetIds = new Set(
+      this.datasets.filter((d) => d.storageMode === 'disk').map((d) => d.id),
+    );
+    if (diskDatasetIds.size === 0) {
+      return {
+        ...memRes,
+        scanMetrics: {
+          scannedRecords: stats.totalRecords,
+          scannedDatasets: stats.totalDatasets,
+          scannedBytes: this.getTotalDataBytes(),
+        },
+      };
+    }
+
+    const resolveShard = (dsId: string) => this.getDatasetShardPath(dsId);
+    const qLower = query.toLowerCase();
+    const initialTypedKeys: string[] = [];
+    if (detectedType === 'discord_id') {
+      initialTypedKeys.push(`id:${query}`);
+    } else if (detectedType === 'email') {
+      initialTypedKeys.push(`em:${qLower}`);
+    } else if (detectedType === 'username') {
+      initialTypedKeys.push(`un:${qLower.replace(/^@/, '')}`);
+    } else {
+      initialTypedKeys.push(`id:${query}`, `em:${qLower}`, `un:${qLower.replace(/^@/, '')}`, `ip:${query}`);
+    }
+
+    const diskPrimary = this.diskIndex.lookupRecords(initialTypedKeys, diskDatasetIds, resolveShard);
+    const primaryMap = new Map<string, IntelRecord>();
+    for (const r of memRes.primaryMatches) primaryMap.set(r.id, r);
+    for (const r of diskPrimary) {
+      if (!primaryMap.has(r.id)) primaryMap.set(r.id, r);
+    }
+    const primaryMatches = Array.from(primaryMap.values());
+
+    // Joint multi-hop transitive correlation across BOTH memory and disk index
+    const relatedMap = new Map<string, IntelRecord>();
+    for (const r of memRes.relatedMatches) {
+      if (!primaryMap.has(r.id)) relatedMap.set(r.id, r);
+    }
+
+    const visitedDiscordIds = new Set<string>();
+    const visitedEmails = new Set<string>();
+    const visitedPhones = new Set<string>();
+    const visitedIps = new Set<string>();
+    const visitedUsernames = new Set<string>();
+    const visitedExtraIds = new Set<string>();
+
+    const pendingDiscordIds = new Set<string>();
+    const pendingEmails = new Set<string>();
+    const pendingPhones = new Set<string>();
+    const pendingIps = new Set<string>();
+    const pendingUsernames = new Set<string>();
+    const pendingExtraIds = new Set<string>();
+
+    const queueTokens = (rec: IntelRecord) => {
+      const cached = memIndex.tokensByRecordId.get(rec.id);
+      const snowflakes = cached ? cached.snowflakes : extractRecordSnowflakes(rec);
+      const emails = cached ? cached.emails : extractRecordEmails(rec);
+      const ips = cached ? cached.ips : extractRecordIps(rec);
+      const phones = cached ? cached.phones : extractRecordPhones(rec);
+      const usernames = cached ? cached.usernames : extractRecordUsernames(rec);
+      const extraIds = cached ? cached.extraIds : extractRecordExtraIdentifiers(rec);
+
+      for (const id of snowflakes) if (!visitedDiscordIds.has(id)) pendingDiscordIds.add(id);
+      for (const em of emails) if (!visitedEmails.has(em)) pendingEmails.add(em);
+      for (const ph of phones) if (!visitedPhones.has(ph)) pendingPhones.add(ph);
+      for (const ip of ips) if (!visitedIps.has(ip)) pendingIps.add(ip);
+      for (const un of usernames) if (!visitedUsernames.has(un)) pendingUsernames.add(un);
+      for (const eid of extraIds) if (!visitedExtraIds.has(eid)) pendingExtraIds.add(eid);
+    };
+
+    for (const r of primaryMatches) queueTokens(r);
+    for (const r of relatedMap.values()) queueTokens(r);
+    if (detectedType === 'discord_id') pendingDiscordIds.add(query);
+    else if (detectedType === 'email') pendingEmails.add(qLower);
+
+    let hops = 0;
+    const MAX_HOPS = 10;
+    const MAX_RELATED_CAP = 10000;
+
+    while (
+      hops < MAX_HOPS &&
+      relatedMap.size < MAX_RELATED_CAP &&
+      (pendingDiscordIds.size > 0 ||
+        pendingEmails.size > 0 ||
+        pendingPhones.size > 0 ||
+        pendingIps.size > 0 ||
+        pendingUsernames.size > 0 ||
+        pendingExtraIds.size > 0)
+    ) {
+      hops += 1;
+      const waveIds = Array.from(pendingDiscordIds);
+      const waveEmails = Array.from(pendingEmails);
+      const wavePhones = Array.from(pendingPhones);
+      const waveIps = Array.from(pendingIps);
+      const waveUsernames = Array.from(pendingUsernames);
+      const waveExtraIds = Array.from(pendingExtraIds);
+
+      pendingDiscordIds.clear();
+      pendingEmails.clear();
+      pendingPhones.clear();
+      pendingIps.clear();
+      pendingUsernames.clear();
+      pendingExtraIds.clear();
+
+      const candidates: IntelRecord[] = [];
+      const diskWaveKeys: string[] = [];
+
+      for (const id of waveIds) {
+        visitedDiscordIds.add(id);
+        diskWaveKeys.push(`id:${id}`);
+        const memHits = memIndex.byDiscordId.get(id);
+        if (memHits) for (const item of memHits) candidates.push(item);
+      }
+      for (const em of waveEmails) {
+        visitedEmails.add(em);
+        diskWaveKeys.push(`em:${em}`);
+        const memHits = memIndex.byEmail.get(em);
+        if (memHits) for (const item of memHits) candidates.push(item);
+      }
+      for (const ph of wavePhones) {
+        visitedPhones.add(ph);
+        diskWaveKeys.push(`ph:${ph}`);
+        const memHits = memIndex.byPhone.get(ph);
+        if (memHits) for (const item of memHits) candidates.push(item);
+      }
+      for (const ip of waveIps) {
+        visitedIps.add(ip);
+        diskWaveKeys.push(`ip:${ip}`);
+        const memHits = memIndex.byIp.get(ip);
+        if (memHits) for (const item of memHits) candidates.push(item);
+      }
+      for (const un of waveUsernames) {
+        visitedUsernames.add(un);
+        diskWaveKeys.push(`un:${un}`);
+        const memHits = memIndex.byUsername.get(un);
+        if (memHits) for (const item of memHits) candidates.push(item);
+      }
+      for (const eid of waveExtraIds) {
+        visitedExtraIds.add(eid);
+        diskWaveKeys.push(`ex:${eid}`);
+        const memHits = memIndex.byExtraIdentifier.get(eid);
+        if (memHits) for (const item of memHits) candidates.push(item);
+      }
+
+      if (diskWaveKeys.length > 0) {
+        const diskHits = this.diskIndex.lookupRecords(diskWaveKeys, diskDatasetIds, resolveShard);
+        for (const item of diskHits) candidates.push(item);
+      }
+
+      for (const rec of candidates) {
+        if (primaryMap.has(rec.id) || relatedMap.has(rec.id)) continue;
+        relatedMap.set(rec.id, rec);
+        queueTokens(rec);
+        if (relatedMap.size >= MAX_RELATED_CAP) break;
+      }
+    }
+
+    const scoreRec = (rec: IntelRecord): number => {
+      let s = 0;
+      if (rec.discordId) s += 2;
+      if (rec.email) s += 2;
+      if (rec.username) s += 1;
+      if (rec.ip) s += 1;
+      if (rec.phone) s += 1;
+      if (rec.source) s += 1;
+      if (rec.notes) s += 1;
+      return s + Math.min(5, Object.keys(rec.extra || {}).length);
+    };
+
+    primaryMatches.sort((a, b) => scoreRec(b) - scoreRec(a));
+    const relatedMatches = Array.from(relatedMap.values()).sort((a, b) => scoreRec(b) - scoreRec(a));
+
+    return {
+      query,
+      detectedType,
+      snowflake,
+      primaryMatches,
+      relatedMatches,
+      durationMs: Math.max(0.1, Number((performance.now() - started).toFixed(2))),
+      scanMetrics: {
+        scannedRecords: stats.totalRecords,
+        scannedDatasets: stats.totalDatasets,
+        scannedBytes: this.getTotalDataBytes(),
+      },
+    };
+  }
+
+  runBulkLookupAcrossAllStores(tokens: string[]): BulkQueryRow[] {
+    return tokens.map((token) => {
+      const valid = isValidSnowflake(token);
+      if (!valid) {
+        return {
+          input: token,
+          validSnowflake: false,
+          snowflake: null,
+          matches: [],
+        };
+      }
+      const res = this.searchAcrossAllStores(token, 'discord_id', true);
+      const dedup = new Map<string, IntelRecord>();
+      for (const rec of [...res.primaryMatches, ...res.relatedMatches]) {
+        dedup.set(rec.id, rec);
+      }
+      return {
+        input: token,
+        validSnowflake: true,
+        snowflake: res.snowflake,
+        matches: Array.from(dedup.values()),
+      };
+    });
   }
 
   private recomputeDatasetStats(datasetId: string, knownSizeBytes?: number): DatasetMeta | null {
@@ -839,6 +1396,49 @@ export class ServerStore {
 
     const currentMeta = this.datasets[dsIdx];
     const nextName = updates.name?.trim() || currentMeta.name;
+
+    if (currentMeta.storageMode === 'disk') {
+      const shardPath = this.getDatasetShardPath(datasetId);
+      let addedCount = 0;
+      let addedBytes = 0;
+
+      if (Array.isArray(updates.appendRecords) && updates.appendRecords.length > 0) {
+        const baseCount = currentMeta.recordCount || 0;
+        const prepared = updates.appendRecords.map((r, i) => ({
+          ...r,
+          id: r.id || `${datasetId}_add_${baseCount + i}`,
+          datasetId,
+          datasetName: nextName,
+        }));
+        const baseOffset = fs.existsSync(shardPath) ? fs.statSync(shardPath).size : 0;
+        const writer = this.diskIndex.createWriter(4096);
+        let cursor = baseOffset;
+        let block = '';
+        for (const rec of prepared) {
+          const line = `${JSON.stringify(rec)}\n`;
+          const len = Buffer.byteLength(line, 'utf8');
+          writer.indexRecord(rec, datasetId, cursor, len);
+          cursor += len;
+          block += line;
+        }
+        fs.appendFileSync(shardPath, block, 'utf8');
+        writer.flush();
+        addedCount = prepared.length;
+        addedBytes = cursor - baseOffset;
+      }
+
+      const updatedMeta: DatasetMeta = {
+        ...currentMeta,
+        name: nextName,
+        mapping: updates.mapping || currentMeta.mapping,
+        recordCount: (currentMeta.recordCount || 0) + addedCount,
+        sizeBytes: (currentMeta.sizeBytes || 0) + addedBytes,
+      };
+      this.datasets[dsIdx] = updatedMeta;
+      writeJsonFile(this.datasetsFile, this.datasets);
+      return updatedMeta;
+    }
+
     let dsRecords = this.records.filter((r) => r.datasetId === datasetId);
 
     if (updates.name && updates.name.trim()) {
@@ -898,14 +1498,30 @@ export class ServerStore {
     dataset: DatasetMeta;
     record: IntelRecord;
   } {
-    const ds = this.getDatasetById(datasetId);
-    if (!ds) throw new Error('Veri deposu bulunamadı.');
+    const dsIdx = this.datasets.findIndex((d) => d.id === datasetId);
+    if (dsIdx < 0) throw new Error('Veri deposu bulunamadı.');
+    const ds = this.datasets[dsIdx];
     const created: IntelRecord = {
       ...rec,
       id: `${datasetId}_m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       datasetId,
       datasetName: ds.name,
     };
+
+    if (ds.storageMode === 'disk') {
+      const shardPath = this.getDatasetShardPath(datasetId);
+      const writer = this.diskIndex.createWriter(128);
+      const addedBytes = indexRecordBatchToDisk(writer, shardPath, [created], true);
+      const updatedMeta: DatasetMeta = {
+        ...ds,
+        recordCount: (ds.recordCount || 0) + 1,
+        sizeBytes: (ds.sizeBytes || 0) + addedBytes,
+      };
+      this.datasets[dsIdx] = updatedMeta;
+      writeJsonFile(this.datasetsFile, this.datasets);
+      return { dataset: updatedMeta, record: created };
+    }
+
     this.records.push(created);
     const addedBytes = appendNdjsonRecords(this.getDatasetShardPath(datasetId), [created]);
     const updatedMeta = this.recomputeDatasetStats(datasetId, ds.sizeBytes + addedBytes)!;
@@ -956,6 +1572,12 @@ export class ServerStore {
   }
 
   deleteDataset(datasetId: string): boolean {
+    const activeCtrl = this.activeIngestions.get(datasetId);
+    if (activeCtrl) {
+      activeCtrl.abort();
+      this.activeIngestions.delete(datasetId);
+    }
+
     const before = this.datasets.length;
     this.datasets = this.datasets.filter((d) => d.id !== datasetId);
     if (this.datasets.length === before) return false;
@@ -965,6 +1587,10 @@ export class ServerStore {
     const shardPath = this.getDatasetShardPath(datasetId);
     if (fs.existsSync(shardPath)) {
       fs.unlinkSync(shardPath);
+    }
+    const rawPath = this.getRawUploadPath(datasetId);
+    if (fs.existsSync(rawPath)) {
+      fs.unlinkSync(rawPath);
     }
     writeJsonFile(this.datasetsFile, this.datasets);
     return true;
@@ -1107,11 +1733,13 @@ export class ServerStore {
   }
 
   getCloudSnapshot() {
+    const memoryDatasets = this.datasets.filter((d) => d.storageMode !== 'disk');
+    const memDsIds = new Set(memoryDatasets.map((d) => d.id));
     return {
       users: structuredClone(this.users),
       roles: this.getRoleConfigs(),
-      datasets: this.getDatasets(),
-      records: this.records,
+      datasets: [...memoryDatasets].sort((a, b) => b.importedAt.localeCompare(a.importedAt)),
+      records: this.records.filter((r) => memDsIds.has(r.datasetId)),
       queryLogs: [...this.queryLogs],
       blockedAttempts: [...this.blockedAttempts],
       blacklist: this.getBlacklist(),

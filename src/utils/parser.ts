@@ -6,6 +6,9 @@ export interface ParsedTableResult {
   columns: string[];
   rows: Record<string, string>[];
   suggestedMapping: FieldMapping;
+  delimiter?: string;
+  hasHeader?: boolean;
+  isHeterogeneous?: boolean;
 }
 
 const DISCORD_ID_KEYS = [
@@ -120,15 +123,19 @@ function parseCsvLine(line: string, delimiter: string): string[] {
 
 function detectDelimiter(lines: string[]): string {
   const candidates = [',', ';', '\t', '|', ':'];
-  const sample = lines.slice(0, 15);
+  const sample = lines.slice(0, 15).map((l) => l.replace(/https?:\/\//gi, 'http__//'));
   let bestDelim = ',';
   let bestScore = -1;
 
   for (const delim of candidates) {
-    const counts = sample.map((l) => parseCsvLine(l, delim).length);
-    const minCount = Math.min(...counts);
-    const maxCount = Math.max(...counts);
-    if (minCount >= 2) {
+    let minCount = Infinity;
+    let maxCount = 0;
+    for (let i = 0; i < sample.length; i++) {
+      const cnt = parseCsvLine(sample[i], delim).length;
+      if (cnt < minCount) minCount = cnt;
+      if (cnt > maxCount) maxCount = cnt;
+    }
+    if (sample.length > 0 && minCount >= 2) {
       const consistency = minCount === maxCount ? 100 : 10;
       const priority = delim === ',' ? 5 : delim === ';' ? 4 : delim === '\t' ? 3 : delim === '|' ? 2 : 1;
       const score = consistency + minCount * 2 + priority;
@@ -335,8 +342,13 @@ function isHeterogeneousText(lines: string[], delimiter: string, parsedLines: st
 
   const sampleParsed = parsedLines.slice(0, 50);
   const colCounts = sampleParsed.map((c) => c.length);
-  const minCols = Math.min(...colCounts);
-  const maxCols = Math.max(...colCounts);
+  let minCols = Infinity;
+  let maxCols = 0;
+  for (let i = 0; i < colCounts.length; i++) {
+    if (colCounts[i] < minCols) minCols = colCounts[i];
+    if (colCounts[i] > maxCols) maxCols = colCounts[i];
+  }
+  if (colCounts.length === 0) minCols = 0;
 
   // Unstructured or multi-delimiter lines
   if (minCols < 2 && maxCols <= 1) {
@@ -532,10 +544,11 @@ function parseMixedSingleLine(line: string): Record<string, string> {
     }
   }
 
-  // Case B: Delimited or free-text line
-  const lineDelim = detectBestLineDelimiter(line);
-  const rawTokens = lineDelim ? parseCsvLine(line, lineDelim) : line.split(/\s+/);
-  const tokens = rawTokens.map((t) => cleanInvisibleChars(t)).filter(Boolean);
+  // Case B: Delimited or free-text line (preserve http(s):// in ULP lines)
+  const protectedLine = line.replace(/(https?):\/\//gi, '$1\u0000//');
+  const lineDelim = detectBestLineDelimiter(protectedLine);
+  const rawTokens = lineDelim ? parseCsvLine(protectedLine, lineDelim) : protectedLine.split(/\s+/);
+  const tokens = rawTokens.map((t) => cleanInvisibleChars(t.replace(/\u0000/g, ':'))).filter(Boolean);
 
   const snowflakes = (line.match(SNOWFLAKE_GLOBAL_RE) || []).filter((s) => isValidSnowflake(s));
   const emails = line.match(EMAIL_GLOBAL_RE) || [];
@@ -867,13 +880,16 @@ export function parseDatasetContent(rawText: string, fileName?: string): ParsedT
   const parsedLines = lines.map((line) => parseCsvLine(line, delimiter));
 
   if (isHeterogeneousText(lines, delimiter, parsedLines)) {
-    const startIdx = parsedLines.length > 1 && isLikelyHeaderRow(parsedLines[0]) ? 1 : 0;
+    const hasHeader = parsedLines.length > 1 && isLikelyHeaderRow(parsedLines[0]);
+    const startIdx = hasHeader ? 1 : 0;
     const rows = lines.slice(startIdx).map((line) => parseMixedSingleLine(line));
     const columns = ['discord_id', 'email', 'username', 'source', 'ip', 'phone', 'notes'];
     return {
       format: 'text',
       columns,
       rows,
+      hasHeader,
+      isHeterogeneous: true,
       suggestedMapping: {
         discordIdField: 'discord_id',
         emailField: 'email',
@@ -886,11 +902,15 @@ export function parseDatasetContent(rawText: string, fileName?: string): ParsedT
     };
   }
 
-  const maxCols = Math.max(...parsedLines.map((cells) => cells.length));
+  let maxCols = 0;
+  for (let i = 0; i < parsedLines.length; i++) {
+    if (parsedLines[i].length > maxCols) maxCols = parsedLines[i].length;
+  }
   let columns: string[];
   let dataStartIdx = 0;
+  const hasHeader = parsedLines.length > 1 && isLikelyHeaderRow(parsedLines[0]);
 
-  if (parsedLines.length > 1 && isLikelyHeaderRow(parsedLines[0])) {
+  if (hasHeader) {
     columns = parsedLines[0].map((col, idx) => col || `sutun_${idx + 1}`);
     dataStartIdx = 1;
   } else {
@@ -925,17 +945,113 @@ export function parseDatasetContent(rawText: string, fileName?: string): ParsedT
     format,
     columns,
     rows,
+    delimiter,
+    hasHeader,
+    isHeterogeneous: false,
     suggestedMapping: detectFieldMapping(columns, rows),
   };
 }
 
-export function normalizeRows(
-  rows: Record<string, string>[],
-  mapping: FieldMapping,
-  datasetId: string,
-  datasetName: string,
-): IntelRecord[] {
-  const mappedFields = new Set(
+export function parseDatasetSample(sampleText: string, fileName?: string, totalFileBytes?: number): ParsedTableResult {
+  const cleaned = sampleText.replace(/^\uFEFF/, '');
+  const isTruncatedSample = totalFileBytes !== undefined && totalFileBytes > sampleText.length;
+
+  // For truncated text/ndjson/csv/sql slices, drop the potentially cut-off last line
+  let sampleToParse = cleaned;
+  const trimmedStart = cleaned.trimStart();
+  const looksLikeJsonArray = trimmedStart.startsWith('[') || trimmedStart.startsWith('{');
+
+  if (isTruncatedSample && !looksLikeJsonArray) {
+    const lastNl = cleaned.lastIndexOf('\n');
+    if (lastNl > 0) {
+      sampleToParse = cleaned.slice(0, lastNl);
+    }
+  }
+
+  const extractTruncatedJsonObjects = (): ParsedTableResult | null => {
+    const extractedRows: Record<string, string>[] = [];
+    const colSet = new Set<string>();
+    let depth = 0;
+    let inStr = false;
+    let escaped = false;
+    let objStart = -1;
+
+    for (let i = 0; i < cleaned.length && extractedRows.length < 50; i++) {
+      const ch = cleaned[i];
+      if (inStr) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === '"') {
+          inStr = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inStr = true;
+        continue;
+      }
+      if (ch === '{') {
+        if (depth === 0) objStart = i;
+        else if (trimmedStart.startsWith('{') && depth === 1 && objStart === -1) objStart = i;
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (objStart !== -1 && (depth === 0 || (trimmedStart.startsWith('{') && depth === 1))) {
+          const snippet = cleaned.slice(objStart, i + 1);
+          try {
+            const obj = JSON.parse(snippet) as unknown;
+            if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+              const flat = flattenObject(obj as Record<string, unknown>);
+              for (const k of Object.keys(flat)) colSet.add(k);
+              extractedRows.push(flat);
+            }
+          } catch {
+            // Ignore partial object
+          }
+          objStart = -1;
+        }
+      }
+    }
+
+    if (extractedRows.length > 0) {
+      const columns = Array.from(colSet);
+      return {
+        format:
+          fileName?.toLowerCase().endsWith('.ndjson') || fileName?.toLowerCase().endsWith('.jsonl')
+            ? 'ndjson'
+            : 'json',
+        columns,
+        rows: extractedRows,
+        suggestedMapping: detectFieldMapping(columns, extractedRows),
+      };
+    }
+    return null;
+  };
+
+  if (isTruncatedSample && looksLikeJsonArray) {
+    const jsonSample = extractTruncatedJsonObjects();
+    if (jsonSample) return jsonSample;
+  }
+
+  try {
+    return parseDatasetContent(sampleToParse, fileName);
+  } catch {
+    if (looksLikeJsonArray) {
+      const jsonSample = extractTruncatedJsonObjects();
+      if (jsonSample) return jsonSample;
+    }
+
+    // Fallback to line-based sample parse on truncated multi-line files
+    const lastNl = cleaned.lastIndexOf('\n');
+    const safeLines = lastNl > 0 ? cleaned.slice(0, lastNl) : cleaned;
+    return parseDatasetContent(safeLines, fileName);
+  }
+}
+
+export function buildMappedFieldSet(mapping: FieldMapping): Set<string> {
+  return new Set(
     [
       mapping.discordIdField,
       mapping.emailField,
@@ -946,140 +1062,163 @@ export function normalizeRows(
       mapping.notesField,
     ].filter((f): f is string => Boolean(f)),
   );
-
-  return rows.map((row, idx) => {
-    const extra: Record<string, string> = {};
-    if (row.__extra_json) {
-      try {
-        const parsedExtra = JSON.parse(row.__extra_json) as Record<string, unknown>;
-        if (parsedExtra && typeof parsedExtra === 'object' && !Array.isArray(parsedExtra)) {
-          for (const [ek, ev] of Object.entries(parsedExtra)) {
-            if (ek === '__proto__' || ek === 'constructor' || ek === 'prototype') continue;
-            const cleanEv = cleanInvisibleChars(String(ev ?? ''));
-            if (cleanEv) extra[ek] = cleanEv;
-          }
-        }
-      } catch {
-        // Ignore malformed internal extra payload
-      }
-    }
-    for (const [key, val] of Object.entries(row)) {
-      if (key === '__extra_json') continue;
-      const cleaned = cleanInvisibleChars(val || '');
-      if (!mappedFields.has(key) && cleaned !== '') {
-        extra[key] = cleaned;
-      }
-    }
-
-    const rawMappedDiscordId = mapping.discordIdField ? cleanInvisibleChars(row[mapping.discordIdField] || '') : '';
-    let discordId = '';
-    if (rawMappedDiscordId) {
-      if (isValidSnowflake(rawMappedDiscordId)) {
-        discordId = rawMappedDiscordId;
-      } else {
-        const inlineMatch = rawMappedDiscordId.match(SNOWFLAKE_INLINE_RE);
-        if (inlineMatch && isValidSnowflake(inlineMatch[1])) {
-          discordId = inlineMatch[1];
-        } else {
-          extra[mapping.discordIdField || 'raw_id'] = rawMappedDiscordId;
-        }
-      }
-    }
-    if (!discordId) {
-      for (const val of Object.values(row)) {
-        const match = (val || '').match(SNOWFLAKE_INLINE_RE);
-        if (match && isValidSnowflake(match[1])) {
-          discordId = match[1];
-          break;
-        }
-      }
-    }
-
-    const rawMappedEmail = mapping.emailField ? cleanInvisibleChars(row[mapping.emailField] || '') : '';
-    let email = '';
-    if (rawMappedEmail) {
-      const inlineMatch = rawMappedEmail.match(EMAIL_INLINE_RE);
-      if (inlineMatch) {
-        email = inlineMatch[0];
-      } else {
-        extra[mapping.emailField || 'raw_email'] = rawMappedEmail;
-      }
-    }
-    if (!email) {
-      for (const val of Object.values(row)) {
-        const match = (val || '').match(EMAIL_INLINE_RE);
-        if (match) {
-          email = match[0];
-          break;
-        }
-      }
-    }
-
-    const rawMappedIp = mapping.ipField ? cleanInvisibleChars(row[mapping.ipField] || '') : '';
-    let ip = '';
-    if (rawMappedIp) {
-      const ipv4 = rawMappedIp.match(IPV4_INLINE_RE);
-      if (ipv4) {
-        ip = ipv4[0];
-      } else if (rawMappedIp.includes(':') && /^[0-9a-fA-F:]+$/.test(rawMappedIp)) {
-        ip = rawMappedIp;
-      } else {
-        extra[mapping.ipField || 'raw_ip'] = rawMappedIp;
-      }
-    }
-    if (!ip) {
-      for (const val of Object.values(row)) {
-        const trimmed = (val || '').trim();
-        const match = trimmed.match(IPV4_INLINE_RE);
-        if (match) {
-          ip = match[0];
-          break;
-        }
-      }
-    }
-
-    const rawMappedPhone = mapping.phoneField ? cleanInvisibleChars(row[mapping.phoneField] || '') : '';
-    let phone = '';
-    if (rawMappedPhone) {
-      if (isValidPhoneCandidate(rawMappedPhone)) {
-        phone = rawMappedPhone;
-      } else {
-        const candidates = rawMappedPhone.match(PHONE_CANDIDATE_RE) || [];
-        const hit = candidates.find((c) => isValidPhoneCandidate(c));
-        if (hit) {
-          phone = hit.trim();
-        } else {
-          extra[mapping.phoneField || 'raw_phone'] = rawMappedPhone;
-        }
-      }
-    }
-    if (!phone) {
-      for (const [k, val] of Object.entries(row)) {
-        if (k === mapping.discordIdField || k === mapping.ipField) continue;
-        const candidates = (val || '').match(PHONE_CANDIDATE_RE) || [];
-        const hit = candidates.find((c) => isValidPhoneCandidate(c));
-        if (hit) {
-          phone = hit.trim();
-          break;
-        }
-      }
-    }
-
-    return {
-      id: `${datasetId}_${idx}`,
-      datasetId,
-      datasetName,
-      discordId,
-      email,
-      username: mapping.usernameField ? cleanInvisibleChars(row[mapping.usernameField] || '') : '',
-      source: mapping.sourceField ? cleanInvisibleChars(row[mapping.sourceField] || '') : '',
-      ip,
-      phone,
-      notes: mapping.notesField ? cleanInvisibleChars(row[mapping.notesField] || '') : '',
-      extra,
-    };
-  });
 }
+
+export function normalizeSingleRow(
+  row: Record<string, string>,
+  mapping: FieldMapping,
+  datasetId: string,
+  datasetName: string,
+  idx: number,
+  mappedFields: Set<string> = buildMappedFieldSet(mapping),
+): IntelRecord {
+  const extra: Record<string, string> = {};
+  if (row.__extra_json) {
+    try {
+      const parsedExtra = JSON.parse(row.__extra_json) as Record<string, unknown>;
+      if (parsedExtra && typeof parsedExtra === 'object' && !Array.isArray(parsedExtra)) {
+        for (const [ek, ev] of Object.entries(parsedExtra)) {
+          if (ek === '__proto__' || ek === 'constructor' || ek === 'prototype') continue;
+          const cleanEv = cleanInvisibleChars(String(ev ?? ''));
+          if (cleanEv) extra[ek] = cleanEv;
+        }
+      }
+    } catch {
+      // Ignore malformed internal extra payload
+    }
+  }
+  for (const [key, val] of Object.entries(row)) {
+    if (key === '__extra_json') continue;
+    const cleaned = cleanInvisibleChars(val || '');
+    if (!mappedFields.has(key) && cleaned !== '') {
+      extra[key] = cleaned;
+    }
+  }
+
+  const rawMappedDiscordId = mapping.discordIdField ? cleanInvisibleChars(row[mapping.discordIdField] || '') : '';
+  let discordId = '';
+  if (rawMappedDiscordId) {
+    if (isValidSnowflake(rawMappedDiscordId)) {
+      discordId = rawMappedDiscordId;
+    } else {
+      const inlineMatch = rawMappedDiscordId.match(SNOWFLAKE_INLINE_RE);
+      if (inlineMatch && isValidSnowflake(inlineMatch[1])) {
+        discordId = inlineMatch[1];
+      } else {
+        extra[mapping.discordIdField || 'raw_id'] = rawMappedDiscordId;
+      }
+    }
+  }
+  if (!discordId) {
+    for (const val of Object.values(row)) {
+      const match = (val || '').match(SNOWFLAKE_INLINE_RE);
+      if (match && isValidSnowflake(match[1])) {
+        discordId = match[1];
+        break;
+      }
+    }
+  }
+
+  const rawMappedEmail = mapping.emailField ? cleanInvisibleChars(row[mapping.emailField] || '') : '';
+  let email = '';
+  if (rawMappedEmail) {
+    const inlineMatch = rawMappedEmail.match(EMAIL_INLINE_RE);
+    if (inlineMatch) {
+      email = inlineMatch[0];
+    } else {
+      extra[mapping.emailField || 'raw_email'] = rawMappedEmail;
+    }
+  }
+  if (!email) {
+    for (const val of Object.values(row)) {
+      const match = (val || '').match(EMAIL_INLINE_RE);
+      if (match) {
+        email = match[0];
+        break;
+      }
+    }
+  }
+
+  const rawMappedIp = mapping.ipField ? cleanInvisibleChars(row[mapping.ipField] || '') : '';
+  let ip = '';
+  if (rawMappedIp) {
+    const ipv4 = rawMappedIp.match(IPV4_INLINE_RE);
+    if (ipv4) {
+      ip = ipv4[0];
+    } else if (rawMappedIp.includes(':') && /^[0-9a-fA-F:]+$/.test(rawMappedIp)) {
+      ip = rawMappedIp;
+    } else {
+      extra[mapping.ipField || 'raw_ip'] = rawMappedIp;
+    }
+  }
+  if (!ip) {
+    for (const val of Object.values(row)) {
+      const trimmed = (val || '').trim();
+      const match = trimmed.match(IPV4_INLINE_RE);
+      if (match) {
+        ip = match[0];
+        break;
+      }
+    }
+  }
+
+  const rawMappedPhone = mapping.phoneField ? cleanInvisibleChars(row[mapping.phoneField] || '') : '';
+  let phone = '';
+  if (rawMappedPhone) {
+    if (isValidPhoneCandidate(rawMappedPhone)) {
+      phone = rawMappedPhone;
+    } else {
+      const candidates = rawMappedPhone.match(PHONE_CANDIDATE_RE) || [];
+      const hit = candidates.find((c) => isValidPhoneCandidate(c));
+      if (hit) {
+        phone = hit.trim();
+      } else {
+        extra[mapping.phoneField || 'raw_phone'] = rawMappedPhone;
+      }
+    }
+  }
+  if (!phone) {
+    for (const [k, val] of Object.entries(row)) {
+      if (k === mapping.discordIdField || k === mapping.ipField) continue;
+      const candidates = (val || '').match(PHONE_CANDIDATE_RE) || [];
+      const hit = candidates.find((c) => isValidPhoneCandidate(c));
+      if (hit) {
+        phone = hit.trim();
+        break;
+      }
+    }
+  }
+
+  return {
+    id: `${datasetId}_${idx}`,
+    datasetId,
+    datasetName,
+    discordId,
+    email,
+    username: mapping.usernameField ? cleanInvisibleChars(row[mapping.usernameField] || '') : '',
+    source: mapping.sourceField ? cleanInvisibleChars(row[mapping.sourceField] || '') : '',
+    ip,
+    phone,
+    notes: mapping.notesField ? cleanInvisibleChars(row[mapping.notesField] || '') : '',
+    extra,
+  };
+}
+
+export function normalizeRows(
+  rows: Record<string, string>[],
+  mapping: FieldMapping,
+  datasetId: string,
+  datasetName: string,
+): IntelRecord[] {
+  const mappedFields = buildMappedFieldSet(mapping);
+  const out: IntelRecord[] = new Array(rows.length);
+  for (let i = 0; i < rows.length; i++) {
+    out[i] = normalizeSingleRow(rows[i], mapping, datasetId, datasetName, i, mappedFields);
+  }
+  return out;
+}
+
+export { cleanInvisibleChars, flattenObject, parseCsvLine, parseMixedSingleLine, splitSqlTuples };
 
 export function reNormalizeDatasetRecords(
   records: IntelRecord[],

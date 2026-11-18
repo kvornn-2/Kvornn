@@ -31,8 +31,13 @@ import {
 import { ServerStore } from './server/store.ts';
 import { runEmailOsint } from './server/emailOsint.ts';
 import { decodeSnowflake, isValidSnowflake } from './src/utils/snowflake.ts';
-import { classifyRecordDatabaseType, filterDatabaseRecords, runBulkLookup, searchRecords } from './src/utils/search.ts';
-import { buildSafeExportFilename, recordsToCsv, recordsToJsonExport } from './src/utils/exportData.ts';
+import { classifyRecordDatabaseType, filterDatabaseRecords } from './src/utils/search.ts';
+import {
+  buildSafeExportFilename,
+  recordsToCsv,
+  recordsToJsonExport,
+  sanitizeCsvCellForExcel,
+} from './src/utils/exportData.ts';
 import { createSyntheticTestDataset } from './src/utils/storage.ts';
 import type { DatasetCategory, DatasetMeta, FieldMapping, IntelRecord, PublicUser, StandardRole } from './src/types/intel.ts';
 
@@ -184,6 +189,96 @@ app.use('/api', (_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   next();
 });
+
+// High-throughput raw binary upload pipeline (exempt from globalApiLimiter 120req/min so large multi-chunk files never 429/ban Admin)
+app.post(
+  '/api/admin/upload/init',
+  ipShieldMiddleware,
+  requireAdmin,
+  express.json({ limit: '256kb' }),
+  sanitizeRequestBodyMiddleware,
+  (req, res) => {
+    const rawName = sanitizeString(req.body?.name, 140) || `Veri_Deposu_${Date.now()}`;
+    const rawFormat = typeof req.body?.format === 'string' ? req.body.format : 'text';
+    const format: DatasetMeta['format'] = ['json', 'csv', 'ndjson', 'text'].includes(rawFormat)
+      ? (rawFormat as DatasetMeta['format'])
+      : 'text';
+    const sizeBytes = typeof req.body?.sizeBytes === 'number' && Number.isFinite(req.body.sizeBytes)
+      ? Math.max(0, req.body.sizeBytes)
+      : 0;
+    const columns = Array.isArray(req.body?.columns)
+      ? req.body.columns.slice(0, 50).map((c: unknown) => sanitizeString(c, 60)).filter(Boolean)
+      : [];
+    const mapping = (req.body?.mapping && typeof req.body.mapping === 'object' ? req.body.mapping : {}) as FieldMapping;
+    const requestedId = sanitizeString(req.body?.id, 80);
+
+    const dataset = store.initRawUploadDataset({
+      id: requestedId || undefined,
+      name: rawName,
+      format,
+      sizeBytes,
+      columns,
+      mapping,
+    });
+    res.status(201).json({ dataset, stats: store.getStats() });
+  },
+);
+
+app.post(
+  '/api/admin/upload/:id/chunk',
+  ipShieldMiddleware,
+  requireAdmin,
+  express.raw({ type: '*/*', limit: '16mb' }),
+  (req, res) => {
+    const datasetId = sanitizeString(req.params.id, 100);
+    const chunk = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    const rawOffsetHeader = req.headers['x-chunk-offset'];
+    const rawOffsetParam = req.query.offset ?? (Array.isArray(rawOffsetHeader) ? rawOffsetHeader[0] : rawOffsetHeader);
+    const parsedOffset = rawOffsetParam !== undefined ? Number(rawOffsetParam) : undefined;
+    const offset = parsedOffset !== undefined && Number.isFinite(parsedOffset) && parsedOffset >= 0 ? parsedOffset : undefined;
+
+    try {
+      const receivedBytes = store.appendRawUploadChunk(datasetId, chunk, offset);
+      res.json({ ok: true, receivedBytes });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : 'Yükleme oturumu bulunamadı.' });
+    }
+  },
+);
+
+app.post(
+  '/api/admin/upload/:id/complete',
+  ipShieldMiddleware,
+  requireAdmin,
+  express.json({ limit: '256kb' }),
+  sanitizeRequestBodyMiddleware,
+  (req, res) => {
+    const datasetId = sanitizeString(req.params.id, 100);
+    try {
+      const delimiter = typeof req.body?.delimiter === 'string' && req.body.delimiter.length > 0 ? req.body.delimiter.slice(0, 4) : undefined;
+      const hasHeader = typeof req.body?.hasHeader === 'boolean' ? req.body.hasHeader : undefined;
+      const isHeterogeneous = typeof req.body?.isHeterogeneous === 'boolean' ? req.body.isHeterogeneous : undefined;
+      const mapping = req.body?.mapping && typeof req.body.mapping === 'object' ? (req.body.mapping as FieldMapping) : undefined;
+
+      const dataset = store.startBackgroundIngestion(datasetId, {
+        delimiter,
+        hasHeader,
+        isHeterogeneous,
+        mapping,
+      });
+      res.status(202).json({ dataset, stats: store.getStats() });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : 'Veri deposu bulunamadı.' });
+    }
+  },
+);
+
+app.delete('/api/admin/upload/:id', ipShieldMiddleware, requireAdmin, (req, res) => {
+  const datasetId = sanitizeString(req.params.id, 100);
+  const deleted = store.deleteDataset(datasetId);
+  res.json({ ok: deleted, stats: store.getStats() });
+});
+
 app.use('/api', ipShieldMiddleware, globalApiLimiter);
 // Enforce Admin authentication BEFORE accepting large dataset/snapshot JSON bodies (within Cloud Run 32MB ceiling)
 app.use('/api/datasets', requireAdmin, express.json({ limit: '24mb' }), sanitizeRequestBodyMiddleware);
@@ -496,8 +591,7 @@ app.post('/api/search', requireAuth, searchLimiter, (req: AuthedRequest, res) =>
     return;
   }
 
-  const allRecords = store.getRecords();
-  const rawResult = searchRecords(allRecords, query, 'discord_id', true, allRecords, store.getSearchIndex());
+  const rawResult = store.searchAcrossAllStores(query, 'discord_id', true);
   const isAdmin = user.role === 'Admin';
   const filteredPrimary = rawResult.primaryMatches.filter((r) => !store.isRecordBlacklisted(r));
   const filteredRelated = rawResult.relatedMatches.filter((r) => !store.isRecordBlacklisted(r));
@@ -511,18 +605,12 @@ app.post('/api/search', requireAuth, searchLimiter, (req: AuthedRequest, res) =>
     ip: getClientIp(req),
   });
 
-  const storeStats = store.getStats();
   res.json({
     result: {
       ...rawResult,
       primaryMatches: sanitizeRecordsForRole(filteredPrimary, isAdmin),
       relatedMatches: sanitizeRecordsForRole(filteredRelated, isAdmin),
       maskedByPolicy: false,
-      scanMetrics: {
-        scannedRecords: allRecords.length,
-        scannedDatasets: storeStats.totalDatasets,
-        scannedBytes: store.getTotalDataBytes(),
-      },
     },
     user: store.getUserById(user.id),
   });
@@ -564,7 +652,7 @@ app.post('/api/bulk-search', requireAuth, osintLimiter, (req: AuthedRequest, res
     return;
   }
 
-  const allowedLookup = runBulkLookup(store.getRecords(), allowedTokens.join('\n'), store.getSearchIndex());
+  const allowedLookup = store.runBulkLookupAcrossAllStores(allowedTokens);
   const lookupMap = new Map(allowedLookup.map((row) => [row.input, row]));
   const isAdmin = user.role === 'Admin';
 
@@ -637,10 +725,23 @@ app.post('/api/osint/email', requireAuth, osintLimiter, async (req: AuthedReques
     return;
   }
 
-  const allRecords = store.getRecords();
-  const report = await runEmailOsint(email, allRecords, lang, store.getSearchIndex());
+  const hasDiskDatasets = store.getDatasets().some((d) => d.storageMode === 'disk');
+  const allRecords = hasDiskDatasets ? [] : store.getRecords();
+  const [report, crossEmailRes] = await Promise.all([
+    runEmailOsint(email, allRecords, lang, hasDiskDatasets ? undefined : store.getSearchIndex()),
+    hasDiskDatasets ? Promise.resolve(store.searchAcrossAllStores(email, 'email', true)) : Promise.resolve(null),
+  ]);
+
+  const combinedMap = new Map<string, IntelRecord>();
+  for (const m of report.localMatches) combinedMap.set(m.id, m);
+  if (crossEmailRes) {
+    for (const m of [...crossEmailRes.primaryMatches, ...crossEmailRes.relatedMatches]) {
+      combinedMap.set(m.id, m);
+    }
+  }
+
   const isAdmin = user.role === 'Admin';
-  const safeLocalMatches = report.localMatches.filter((m) => !store.isRecordBlacklisted(m));
+  const safeLocalMatches = Array.from(combinedMap.values()).filter((m) => !store.isRecordBlacklisted(m));
 
   store.appendQueryAuditLog({
     userId: user.id,
@@ -770,7 +871,7 @@ app.get('/api/admin/overview', requireAdmin, (_req, res) => {
     queryLogs: store.getQueryAuditLogs(),
     blockedAttempts: store.getBlockedAttempts(),
     blacklist: store.getBlacklist(),
-    recordsSample: store.getRecords().slice(0, 150),
+    recordsSample: store.getSampleRecordsForAdmin(150),
     stats: store.getStats(),
   });
 });
@@ -803,8 +904,8 @@ app.delete('/api/admin/blacklist', requireAdmin, (req, res) => {
 app.get('/api/admin/database/records', requireAdmin, (req, res) => {
   const q = sanitizeString(req.query.q, 120);
   const datasetId = sanitizeString(req.query.datasetId, 80);
-  const filtered = filterDatabaseRecords(store.getRecords(), q, datasetId || undefined);
-  res.json({ total: filtered.length, records: filtered.slice(0, 200) });
+  const result = store.filterDatabaseRecordsAcrossAll(q, datasetId || undefined, 200);
+  res.json(result);
 });
 
 app.get('/api/admin/export', requireAdmin, (req, res) => {
@@ -826,28 +927,101 @@ app.get('/api/admin/export', requireAdmin, (req, res) => {
     }
   }
 
-  const filtered = filterDatabaseRecords(store.getRecords(), q, datasetId || undefined);
+  const hasDiskScope = store
+    .getDatasets()
+    .some((d) => d.storageMode === 'disk' && (!datasetId || d.id === datasetId));
+
   const baseLabel = dsMeta ? dsMeta.name : q ? 'filtreli-kayitlar' : 'tum-depolar';
   const filename = buildSafeExportFilename(baseLabel, rawFormat);
-
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  res.setHeader('X-Export-Count', String(filtered.length));
   res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  if (!hasDiskScope) {
+    const filtered = filterDatabaseRecords(store.getRecords(), q, datasetId || undefined);
+    res.setHeader('X-Export-Count', String(filtered.length));
+    if (rawFormat === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.send(recordsToCsv(filtered));
+      return;
+    }
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(
+      recordsToJsonExport(filtered, {
+        datasetId: datasetId || undefined,
+        datasetName: dsMeta?.name,
+        query: q || undefined,
+      }),
+    );
+    return;
+  }
+
+  const estimatedTotal = q
+    ? 0
+    : dsMeta
+      ? dsMeta.recordCount
+      : store.getStats().totalRecords;
+  res.setHeader('X-Export-Count', String(estimatedTotal));
 
   if (rawFormat === 'csv') {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.send(recordsToCsv(filtered));
+    const coreHeaders = [
+      'id',
+      'datasetId',
+      'datasetName',
+      'dbType',
+      'discordId',
+      'email',
+      'username',
+      'source',
+      'ip',
+      'phone',
+      'notes',
+    ];
+    res.write(`\uFEFF${coreHeaders.map((h) => sanitizeCsvCellForExcel(h)).join(',')}\r\n`);
+    let batchLines: string[] = [];
+    store.iterateExportRecords({ datasetId: datasetId || undefined, q }, (rec) => {
+      const dbType = classifyRecordDatabaseType(rec);
+      const row = [
+        rec.id || '',
+        rec.datasetId || '',
+        rec.datasetName || '',
+        dbType,
+        rec.discordId || '',
+        rec.email || '',
+        rec.username || '',
+        rec.source || '',
+        rec.ip || '',
+        rec.phone || '',
+        rec.notes || '',
+      ]
+        .map((cell) => sanitizeCsvCellForExcel(cell))
+        .join(',');
+      batchLines.push(row);
+      if (batchLines.length >= 500) {
+        res.write(`${batchLines.join('\r\n')}\r\n`);
+        batchLines = [];
+      }
+    });
+    if (batchLines.length > 0) {
+      res.write(`${batchLines.join('\r\n')}\r\n`);
+    }
+    res.end();
     return;
   }
 
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.send(
-    recordsToJsonExport(filtered, {
-      datasetId: datasetId || undefined,
-      datasetName: dsMeta?.name,
-      query: q || undefined,
-    }),
+  res.write(
+    `{"exportedAt":${JSON.stringify(new Date().toISOString())},"datasetId":${JSON.stringify(datasetId || null)},"datasetName":${JSON.stringify(dsMeta?.name || null)},"query":${JSON.stringify(q || null)},"records":[`,
   );
+  let first = true;
+  let count = 0;
+  store.iterateExportRecords({ datasetId: datasetId || undefined, q }, (rec) => {
+    const enriched = { ...rec, dbType: classifyRecordDatabaseType(rec) };
+    res.write(`${first ? '' : ','}${JSON.stringify(enriched)}`);
+    first = false;
+    count += 1;
+  });
+  res.end(`],"totalRecords":${count}}`);
 });
 
 app.get('/api/admin/datasets/:id/records', requireAdmin, (req, res) => {

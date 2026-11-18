@@ -121,8 +121,8 @@ export function AdminView({
     return t('Toplu Sorgu', 'Bulk Lookup');
   };
 
-  const loadOverview = useCallback(async () => {
-    setLoading(true);
+  const loadOverview = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const data = await apiAdminOverview();
       setAdminVerified(true);
@@ -140,15 +140,30 @@ export function AdminView({
         onUnauthorizedAdmin();
         return;
       }
-      setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Yönetici verileri alınamadı.', 'Failed to load admin data.') });
+      if (!silent) {
+        setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Yönetici verileri alınamadı.', 'Failed to load admin data.') });
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [t, onUnauthorizedAdmin]);
 
   useEffect(() => {
-    loadOverview();
+    loadOverview(false);
   }, [loadOverview, refreshSignal]);
+
+  const hasPendingIngestion = datasets.some(
+    (d) => d.ingestionStatus === 'uploading' || d.ingestionStatus === 'analyzing',
+  );
+
+  useEffect(() => {
+    if (!hasPendingIngestion) return;
+    const timer = window.setInterval(() => {
+      void loadOverview(true);
+      void onStatsChanged();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [hasPendingIngestion, loadOverview, onStatsChanged]);
 
   const handleLoadSynthetic = async () => {
     setFeedback(null);
@@ -734,8 +749,26 @@ export function AdminView({
                         {datasets.map((ds) => (
                           <tr key={ds.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/30">
                             <td className="px-4 py-3 font-semibold text-slate-900 dark:text-slate-100">{ds.name}</td>
-                            <td className="px-4 py-3 font-medium text-emerald-600 dark:text-emerald-400">
-                              {t('Otomatik (Tüm Sorgular)', 'Automatic (All Queries)')}
+                            <td className="px-4 py-3 font-medium">
+                              {ds.ingestionStatus === 'uploading' ? (
+                                <span className="text-amber-600 dark:text-amber-400">
+                                  {t('Ham Dosya Aktarılıyor...', 'Uploading Raw File...')}
+                                </span>
+                              ) : ds.ingestionStatus === 'analyzing' ? (
+                                <span className="text-blue-600 dark:text-blue-400">
+                                  {t('Arka Planda Analiz Ediliyor...', 'Analyzing in Background...')}
+                                </span>
+                              ) : ds.ingestionStatus === 'error' ? (
+                                <span className="text-red-600 dark:text-red-400" title={ds.ingestionError || ''}>
+                                  {t('Analiz Hatası', 'Analysis Error')}
+                                </span>
+                              ) : (
+                                <span className="text-emerald-600 dark:text-emerald-400">
+                                  {ds.storageMode === 'disk'
+                                    ? t('Otomatik · Disk İndeks (Tüm Sorgular)', 'Automatic · Disk Index (All Queries)')
+                                    : t('Otomatik (Tüm Sorgular)', 'Automatic (All Queries)')}
+                                </span>
+                              )}
                             </td>
                             <td className="px-4 py-3 font-mono uppercase text-slate-600 dark:text-slate-300">{ds.format}</td>
                             <td className="px-4 py-3 text-right font-mono tabular-nums text-slate-800 dark:text-slate-200">

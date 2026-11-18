@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { IntelRecord } from '../types/intel';
 import { decodeSnowflake, isValidSnowflake } from './snowflake';
-import { parseDatasetContent, normalizeRows, reNormalizeDatasetRecords } from './parser';
+import { parseDatasetContent, parseDatasetSample, normalizeRows, reNormalizeDatasetRecords } from './parser';
 import {
   searchRecords,
   runBulkLookup,
@@ -604,5 +604,35 @@ test('CSV & JSON export guards Excel formula injection, includes UTF-8 BOM, and 
     'sentarika-veri-2026-11-17.json',
   );
 });
+
+test('parseDatasetSample handles ULP https:// URLs, truncated JSON arrays, and 160k+ lines without call stack overflow', () => {
+  // 1. ULP format with https:// URL + email + password must not break on the https:// colon
+  const ulpSample = [
+    'https://secretline.top/login:kuzey.ulp@example.test:Pass123!',
+    'http://portal.demo.invalid:ayse.ulp@demo.invalid:Secret99|discord=104567890123456789',
+  ].join('\n');
+  const parsedUlp = parseDatasetSample(ulpSample, 'ulp_dump.txt', ulpSample.length);
+  const ulpRecords = normalizeRows(parsedUlp.rows, parsedUlp.suggestedMapping, 'ds_ulp', 'ULP');
+  assert.equal(ulpRecords.length, 2);
+  assert.equal(ulpRecords[0].email, 'kuzey.ulp@example.test');
+  assert.equal(ulpRecords[1].email, 'ayse.ulp@demo.invalid');
+  assert.equal(ulpRecords[1].discordId, '104567890123456789');
+
+  // 2. Truncated 64KB JSON array slice recovers complete objects cleanly
+  const truncatedJson =
+    '[{"discord_id":"104567890123456789","email":"ok@example.test"},{"discord_id":"289104567890123456","email":"cut_off';
+  const parsedJsonSample = parseDatasetSample(truncatedJson, 'huge.json', 50_000_000);
+  assert.equal(parsedJsonSample.rows.length, 1);
+  assert.equal(parsedJsonSample.rows[0].email, 'ok@example.test');
+
+  // 3. 160,000 lines (exceeds V8 ~120k spread argument limit) parses without RangeError
+  const bigLines = new Array(160_000);
+  for (let i = 0; i < bigLines.length; i++) {
+    bigLines[i] = `104567890123456789:row${i}@example.test:user_${i}`;
+  }
+  const bigResult = parseDatasetContent(bigLines.join('\n'), 'big_160k.txt');
+  assert.equal(bigResult.rows.length, 160_000);
+});
+
 
 

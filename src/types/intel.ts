@@ -36,6 +36,9 @@ export interface DatasetMeta {
   mapping: FieldMapping;
   importedAt: string;
   sizeBytes: number;
+  storageMode?: 'memory' | 'disk';
+  ingestionStatus?: 'uploading' | 'analyzing' | 'ready' | 'error';
+  ingestionError?: string;
 }
 
 export type DatabaseSourceType = 'leak' | 'sizinti' | 'public_info';

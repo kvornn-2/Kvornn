@@ -1,8 +1,19 @@
-import { useState, type ChangeEvent } from 'react';
-import { FileUp, X, AlertCircle, CheckCircle2 } from 'lucide-react';
-import type { DatasetCategory, DatasetMeta, FieldMapping, IntelRecord } from '../types/intel';
+import { useRef, useState, type ChangeEvent } from 'react';
+import { FileUp, X, AlertCircle, CheckCircle2, Zap } from 'lucide-react';
+import type { DatasetMeta, FieldMapping, IntelRecord } from '../types/intel';
 import { useI18n } from '../i18n/I18nContext';
-import { normalizeRows, parseDatasetContent, type ParsedTableResult } from '../utils/parser';
+import {
+  apiAdminUploadAbort,
+  apiAdminUploadChunk,
+  apiAdminUploadComplete,
+  apiAdminUploadInit,
+} from '../utils/api';
+import {
+  normalizeRows,
+  parseDatasetContent,
+  parseDatasetSample,
+  type ParsedTableResult,
+} from '../utils/parser';
 
 interface ImportModalProps {
   open: boolean;
@@ -12,9 +23,34 @@ interface ImportModalProps {
     records: IntelRecord[],
     onProgress?: (uploaded: number, total: number) => void,
   ) => Promise<void>;
+  onRawUploadStarted?: (
+    dataset: DatasetMeta,
+    stats: { totalDatasets: number; totalRecords: number; totalUsers: number },
+  ) => void;
 }
 
-export function ImportModal({ open, onClose, onImportComplete }: ImportModalProps) {
+const SAMPLE_PREVIEW_BYTES = 64 * 1024;
+const RAW_CHUNK_BYTES = 2 * 1024 * 1024;
+const DIRECT_PASTE_MAX_BYTES = 128 * 1024;
+
+function formatByteVolume(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let idx = 0;
+  let val = bytes;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx += 1;
+  }
+  return `${val >= 100 || idx === 0 ? val.toFixed(0) : val.toFixed(2)} ${units[idx]}`;
+}
+
+export function ImportModal({
+  open,
+  onClose,
+  onImportComplete,
+  onRawUploadStarted,
+}: ImportModalProps) {
   const { lang, t } = useI18n();
   const mappingFields: { key: keyof FieldMapping; label: string }[] = [
     { key: 'discordIdField', label: t('Discord ID Sütunu', 'Discord ID Column') },
@@ -28,48 +64,71 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
   const [inputMode, setInputMode] = useState<'file' | 'paste'>('file');
   const [datasetName, setDatasetName] = useState('');
   const [rawText, setRawText] = useState('');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileSize, setFileSize] = useState(0);
+  const [isSampledPreview, setIsSampledPreview] = useState(false);
   const [parsed, setParsed] = useState<ParsedTableResult | null>(null);
   const [mapping, setMapping] = useState<FieldMapping | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<{ uploaded: number; total: number } | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{
+    uploaded: number;
+    total: number;
+    unit: 'bytes' | 'rows';
+  } | null>(null);
+
+  const abortCtrlRef = useRef<AbortController | null>(null);
+  const activeUploadIdRef = useRef<string | null>(null);
 
   if (!open) return null;
 
   const resetState = () => {
     setDatasetName('');
     setRawText('');
+    setSelectedFile(null);
     setFileSize(0);
+    setIsSampledPreview(false);
     setParsed(null);
     setMapping(null);
     setError(null);
     setSaving(false);
     setUploadProgress(null);
+    abortCtrlRef.current = null;
+    activeUploadIdRef.current = null;
   };
 
   const handleClose = () => {
+    if (abortCtrlRef.current) {
+      abortCtrlRef.current.abort();
+    }
+    if (activeUploadIdRef.current) {
+      const idToAbort = activeUploadIdRef.current;
+      activeUploadIdRef.current = null;
+      void apiAdminUploadAbort(idToAbort);
+    }
     resetState();
     onClose();
   };
 
-  const runParse = (content: string, nameSuggestion?: string, sizeBytes?: number) => {
+  const runSampleParse = (
+    sampleText: string,
+    totalBytes: number,
+    nameSuggestion?: string,
+  ) => {
     setError(null);
     try {
-      const result = parseDatasetContent(content, nameSuggestion);
+      const result = parseDatasetSample(sampleText, nameSuggestion, totalBytes);
       setParsed(result);
       setMapping(result.suggestedMapping);
       if (nameSuggestion && !datasetName) {
         setDatasetName(nameSuggestion.replace(/\.[^.]+$/, ''));
       }
-      if (sizeBytes !== undefined) {
-        setFileSize(sizeBytes);
-      } else {
-        setFileSize(new Blob([content]).size);
-      }
+      setFileSize(totalBytes);
+      setIsSampledPreview(totalBytes > sampleText.length);
     } catch (err) {
       setParsed(null);
       setMapping(null);
+      setIsSampledPreview(false);
       setError(err instanceof Error ? err.message : t('Veri ayrıştırılamadı.', 'Failed to parse data.'));
     }
   };
@@ -78,39 +137,120 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const text = await file.text();
+      setSelectedFile(file);
       setRawText('');
       setDatasetName(file.name.replace(/\.[^.]+$/, ''));
-      runParse(text, file.name, file.size);
+      // Read ONLY the first 64 KB for instant column/format detection — zero browser OOM on multi-GB files
+      const headSlice = file.slice(0, SAMPLE_PREVIEW_BYTES);
+      const sampleText = await headSlice.text();
+      runSampleParse(sampleText, file.size, file.name);
     } catch {
       setError(t('Dosya okunamadı.', 'Could not read file.'));
     }
+  };
+
+  const handleParsePaste = () => {
+    setSelectedFile(null);
+    const totalBytes = new Blob([rawText]).size;
+    const sample = rawText.length > SAMPLE_PREVIEW_BYTES ? rawText.slice(0, SAMPLE_PREVIEW_BYTES) : rawText;
+    runSampleParse(sample, totalBytes, datasetName || undefined);
   };
 
   const handleConfirmImport = async () => {
     if (!parsed || !mapping) return;
     setSaving(true);
     setError(null);
-    setUploadProgress({ uploaded: 0, total: parsed.rows.length });
+
+    const finalName =
+      datasetName.trim() ||
+      `${t('Veri Seti', 'Dataset')} ${new Date().toLocaleTimeString(lang === 'tr' ? 'tr-TR' : 'en-US')}`;
+
+    const useRawStreamPipeline =
+      Boolean(selectedFile) || fileSize > DIRECT_PASTE_MAX_BYTES;
+
+    if (useRawStreamPipeline) {
+      const sourceBlob: Blob = selectedFile ?? new Blob([rawText], { type: 'text/plain;charset=utf-8' });
+      const totalBytes = sourceBlob.size;
+      const controller = new AbortController();
+      abortCtrlRef.current = controller;
+      setUploadProgress({ uploaded: 0, total: totalBytes, unit: 'bytes' });
+
+      try {
+        const initRes = await apiAdminUploadInit({
+          name: finalName,
+          format: parsed.format,
+          sizeBytes: totalBytes,
+          columns: parsed.columns,
+          mapping,
+        });
+        const datasetId = initRes.dataset.id;
+        activeUploadIdRef.current = datasetId;
+
+        for (let offset = 0; offset < totalBytes; offset += RAW_CHUNK_BYTES) {
+          if (controller.signal.aborted) {
+            throw new Error(t('Yükleme iptal edildi.', 'Upload cancelled.'));
+          }
+          const slice = sourceBlob.slice(offset, Math.min(totalBytes, offset + RAW_CHUNK_BYTES));
+          await apiAdminUploadChunk(datasetId, slice, offset, controller.signal);
+          setUploadProgress({
+            uploaded: Math.min(totalBytes, offset + slice.size),
+            total: totalBytes,
+            unit: 'bytes',
+          });
+        }
+
+        const completed = await apiAdminUploadComplete(datasetId, {
+          delimiter: parsed.delimiter,
+          hasHeader: parsed.hasHeader,
+          isHeterogeneous: parsed.isHeterogeneous,
+          mapping,
+        });
+
+        activeUploadIdRef.current = null;
+        abortCtrlRef.current = null;
+        onRawUploadStarted?.(completed.dataset, completed.stats);
+        resetState();
+        onClose();
+      } catch (err) {
+        if (activeUploadIdRef.current) {
+          const idToAbort = activeUploadIdRef.current;
+          activeUploadIdRef.current = null;
+          void apiAdminUploadAbort(idToAbort);
+        }
+        abortCtrlRef.current = null;
+        setError(
+          err instanceof Error
+            ? err.message
+            : t('Ham dosya sunucuya aktarılırken hata oluştu.', 'Failed to stream file to server.'),
+        );
+        setSaving(false);
+        setUploadProgress(null);
+      }
+      return;
+    }
+
+    // Small paste text path (<= 128 KB): instant inline normalization & cloud backup sync
     try {
-      const finalName = datasetName.trim() || `${t('Veri Seti', 'Dataset')} ${new Date().toLocaleTimeString(lang === 'tr' ? 'tr-TR' : 'en-US')}`;
+      const fullParsed = parseDatasetContent(rawText, datasetName || undefined);
+      setUploadProgress({ uploaded: 0, total: fullParsed.rows.length, unit: 'rows' });
       const datasetId = `ds_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      const records = normalizeRows(parsed.rows, mapping, datasetId, finalName);
+      const records = normalizeRows(fullParsed.rows, mapping, datasetId, finalName);
       const meta: DatasetMeta = {
         id: datasetId,
         name: finalName,
         category: 'both',
-        format: parsed.format,
+        format: fullParsed.format,
         recordCount: records.length,
-        columns: parsed.columns,
+        columns: fullParsed.columns,
         mapping,
         importedAt: new Date().toISOString(),
         sizeBytes: fileSize || new Blob([rawText]).size,
       };
       await onImportComplete(meta, records, (uploaded, total) => {
-        setUploadProgress({ uploaded, total });
+        setUploadProgress({ uploaded, total, unit: 'rows' });
       });
-      handleClose();
+      resetState();
+      onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : t('Veri kaydedilirken hata oluştu.', 'Failed to save dataset.'));
       setSaving(false);
@@ -133,8 +273,8 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
             </h2>
             <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
               {t(
-                'Herhangi bir dosya veya ham metin yükleyin; sistem Discord ID, e-posta, IP ve bağlantılı tüm alanları otomatik algılayıp tüm sorgularda tarar.',
-                'Upload any file or paste raw data; the system automatically detects Discord IDs, emails, IPs, and linked fields across all queries.',
+                'Herhangi bir boyuttaki dosyayı seçin; ham dosya doğrudan sunucuya aktarılıp arka planda sınırsız olarak analiz edilir ve tüm sorgularda taranır.',
+                'Select a file of any size; raw chunks upload directly to the server and are analyzed in the background with no row limits.',
               )}
             </p>
           </div>
@@ -153,7 +293,10 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
             <div className="inline-flex rounded-lg bg-slate-100 p-1 dark:bg-slate-800/80 self-end">
               <button
                 type="button"
-                onClick={() => setInputMode('file')}
+                onClick={() => {
+                  setInputMode('file');
+                  setError(null);
+                }}
                 className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
                   inputMode === 'file'
                     ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white'
@@ -164,7 +307,11 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
               </button>
               <button
                 type="button"
-                onClick={() => setInputMode('paste')}
+                onClick={() => {
+                  setInputMode('paste');
+                  setSelectedFile(null);
+                  setError(null);
+                }}
                 className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
                   inputMode === 'paste'
                     ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white'
@@ -194,10 +341,12 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
             <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50/70 px-6 py-8 text-center transition-colors hover:border-blue-500 hover:bg-blue-50/30 dark:border-slate-700 dark:bg-slate-900/50 dark:hover:border-blue-500 dark:hover:bg-slate-800/40">
               <FileUp className="h-7 w-7 text-slate-400 dark:text-slate-500" />
               <span className="mt-2 text-sm font-medium text-slate-800 dark:text-slate-200">
-                {t('Dosya seçin veya buraya sürükleyin', 'Choose a file or drop it here')}
+                {selectedFile
+                  ? `${selectedFile.name} (${formatByteVolume(selectedFile.size)})`
+                  : t('Dosya seçin veya buraya sürükleyin', 'Choose a file or drop it here')}
               </span>
               <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                {t('Desteklenen formatlar: .json, .jsonl, .ndjson, .csv, .txt, .sql, .log', 'Supported formats: .json, .jsonl, .ndjson, .csv, .txt, .sql, .log')}
+                {t('Desteklenen formatlar: .json, .jsonl, .ndjson, .csv, .txt, .sql, .log (Boyut / Satır sınırı yok)', 'Supported formats: .json, .jsonl, .ndjson, .csv, .txt, .sql, .log (Unlimited size & rows)')}
               </span>
               <input
                 type="file"
@@ -209,7 +358,7 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
           ) : (
             <div className="space-y-2.5">
               <label htmlFor="paste-data-textarea" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                {t('Ham Veri İçeriği (JSON, CSV veya satır bazlı id:eposta:kullanici)', 'Raw Data (JSON, CSV, or line-based id:email:username)')}
+                {t('Ham Veri İçeriği (JSON, CSV, SQL veya satır bazlı id:eposta:kullanici / ULP)', 'Raw Data (JSON, CSV, SQL, or line-based id:email:username / ULP)')}
               </label>
               <textarea
                 id="paste-data-textarea"
@@ -222,7 +371,7 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
               <div className="flex justify-end">
                 <button
                   type="button"
-                  onClick={() => runParse(rawText)}
+                  onClick={handleParsePaste}
                   className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-800 transition-colors hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
                 >
                   {t('Veriyi Çözümle ve Önizle', 'Parse & Preview')}
@@ -240,12 +389,21 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
 
           {parsed && mapping && (
             <div className="space-y-4 border-t border-slate-200 pt-5 dark:border-slate-800">
-              <div className="flex items-center gap-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">
-                <CheckCircle2 className="h-4 w-4" />
-                <span>
-                  {parsed.rows.length.toLocaleString(lang === 'tr' ? 'tr-TR' : 'en-US')} {t('satır ve', 'rows and')} {parsed.columns.length}{' '}
-                  {t('sütun ayrıştırıldı', 'columns parsed')} ({parsed.format.toUpperCase()})
-                </span>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 shrink-0" />
+                  <span>
+                    {isSampledPreview
+                      ? `${formatByteVolume(fileSize)} ${t('ham dosya hazır', 'raw file ready')} · ${parsed.columns.length} ${t('sütun algılandı', 'columns detected')} (${parsed.format.toUpperCase()})`
+                      : `${parsed.rows.length.toLocaleString(lang === 'tr' ? 'tr-TR' : 'en-US')} ${t('satır ve', 'rows and')} ${parsed.columns.length} ${t('sütun ayrıştırıldı', 'columns parsed')} (${parsed.format.toUpperCase()})`}
+                  </span>
+                </div>
+                {(selectedFile || fileSize > DIRECT_PASTE_MAX_BYTES) && (
+                  <span className="inline-flex items-center gap-1 rounded bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-600 dark:text-blue-400">
+                    <Zap className="h-3 w-3" />
+                    <span>{t('Hızlı Akış + Arka Plan Analiz', 'Fast Stream + Background Analysis')}</span>
+                  </span>
+                )}
               </div>
 
               <div>
@@ -321,9 +479,9 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
           <div className="text-xs text-slate-500 dark:text-slate-400">
             {saving && uploadProgress && uploadProgress.total > 0 && (
               <span className="font-mono">
-                {uploadProgress.uploaded.toLocaleString(lang === 'tr' ? 'tr-TR' : 'en-US')} /{' '}
-                {uploadProgress.total.toLocaleString(lang === 'tr' ? 'tr-TR' : 'en-US')} (
-                {Math.min(100, Math.round((uploadProgress.uploaded / uploadProgress.total) * 100))}%)
+                {uploadProgress.unit === 'bytes'
+                  ? `${formatByteVolume(uploadProgress.uploaded)} / ${formatByteVolume(uploadProgress.total)} (${Math.min(100, Math.round((uploadProgress.uploaded / uploadProgress.total) * 100))}%)`
+                  : `${uploadProgress.uploaded.toLocaleString(lang === 'tr' ? 'tr-TR' : 'en-US')} / ${uploadProgress.total.toLocaleString(lang === 'tr' ? 'tr-TR' : 'en-US')} (${Math.min(100, Math.round((uploadProgress.uploaded / uploadProgress.total) * 100))}%)`}
               </span>
             )}
           </div>
@@ -341,7 +499,7 @@ export function ImportModal({ open, onClose, onImportComplete }: ImportModalProp
               onClick={handleConfirmImport}
               className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {saving ? t('Parçalı Aktarılıyor...', 'Uploading Batches...') : t('Veriyi İçe Aktar', 'Import Data')}
+              {saving ? t('Sunucuya Aktarılıyor...', 'Uploading Raw File...') : t('Veriyi İçe Aktar', 'Import Data')}
             </button>
           </div>
         </div>

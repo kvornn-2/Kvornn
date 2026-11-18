@@ -431,4 +431,132 @@ test('ServerStore query blacklist blocks Discord IDs & emails, persists across r
   }
 });
 
+test('Raw chunked upload + background DiskIndex analysis correlates across memory and disk datasets', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentarika-disk-idx-'));
+  try {
+    const store = new ServerStore(tmpDir);
+
+    // 1. In-memory dataset linking Discord ID -> shared email
+    store.addDataset(
+      {
+        id: 'ds_mem_link',
+        name: 'MemForum',
+        category: 'both',
+        format: 'text',
+        recordCount: 1,
+        columns: ['discordId', 'email'],
+        mapping: {
+          discordIdField: 'discordId',
+          emailField: 'email',
+          usernameField: null,
+          sourceField: null,
+          ipField: null,
+          phoneField: null,
+          notesField: null,
+        },
+        importedAt: new Date().toISOString(),
+        sizeBytes: 120,
+      },
+      [
+        {
+          id: 'mem_0',
+          datasetId: 'ds_mem_link',
+          datasetName: 'MemForum',
+          discordId: '104567890123456789',
+          email: 'bridge.target@example.test',
+          username: 'kuzey_mem',
+          source: 'MemForum',
+          ip: '198.51.100.11',
+          phone: '',
+          notes: '',
+          extra: {},
+        },
+      ],
+    );
+
+    // 2. Raw chunked upload of ULP file into disk-backed dataset
+    const rawUlpContent = [
+      'https://secretline.top/login:bridge.target@example.test:UltraSecretPass!|hwid=HWID-DISK-42',
+      'http://shop.demo.invalid:unrelated.disk@example.test:OtherPass99',
+    ].join('\n');
+    const rawBuf = Buffer.from(rawUlpContent, 'utf8');
+    const splitAt = Math.floor(rawBuf.length / 2);
+
+    const diskMeta = store.initRawUploadDataset({
+      id: 'ds_disk_ulp',
+      name: '[ULP]_Secretline_Disk',
+      format: 'text',
+      sizeBytes: rawBuf.length,
+      columns: ['url', 'email', 'password', 'notes'],
+      mapping: {
+        discordIdField: null,
+        emailField: null,
+        usernameField: null,
+        sourceField: null,
+        ipField: null,
+        phoneField: null,
+        notesField: null,
+      },
+    });
+    assert.equal(diskMeta.storageMode, 'disk');
+    assert.equal(diskMeta.ingestionStatus, 'uploading');
+
+    // Write chunks with idempotent byte offsets (including duplicate retry of chunk 1)
+    store.appendRawUploadChunk('ds_disk_ulp', rawBuf.subarray(0, splitAt), 0);
+    store.appendRawUploadChunk('ds_disk_ulp', rawBuf.subarray(0, splitAt), 0);
+    store.appendRawUploadChunk('ds_disk_ulp', rawBuf.subarray(splitAt), splitAt);
+
+    store.startBackgroundIngestion('ds_disk_ulp', {
+      delimiter: ':',
+      hasHeader: false,
+      isHeterogeneous: true,
+    });
+
+    // Wait for async worker completion
+    for (let i = 0; i < 60; i++) {
+      const cur = store.getDatasetById('ds_disk_ulp');
+      if (cur && (cur.ingestionStatus === 'ready' || cur.ingestionStatus === 'error')) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const finished = store.getDatasetById('ds_disk_ulp');
+    assert.ok(finished);
+    assert.equal(finished.ingestionStatus, 'ready');
+    assert.equal(finished.recordCount, 2);
+    assert.equal(store.getStats().totalRecords, 3);
+
+    // Querying Discord ID finds memory primary match AND correlates into disk ULP record via bridge email!
+    const crossRes = store.searchAcrossAllStores('104567890123456789', 'discord_id', true);
+    assert.equal(crossRes.primaryMatches.length, 1);
+    assert.equal(crossRes.relatedMatches.length, 1);
+    assert.equal(crossRes.relatedMatches[0].datasetId, 'ds_disk_ulp');
+    assert.equal(crossRes.relatedMatches[0].email, 'bridge.target@example.test');
+    assert.equal(crossRes.scanMetrics?.scannedRecords, 3);
+
+    // Bulk lookup across both stores also correlates
+    const bulkRes = store.runBulkLookupAcrossAllStores(['104567890123456789']);
+    assert.equal(bulkRes[0].matches.length, 2);
+
+    // Pagination & database filtering across disk datasets work cleanly
+    const paged = store.getDatasetRecordsPaginated('ds_disk_ulp', 'bridge.target@example.test', 1, 10);
+    assert.equal(paged.total, 1);
+    assert.equal(paged.records[0].email, 'bridge.target@example.test');
+
+    // Persisted reload still resolves disk dataset queries cleanly
+    const reloaded = new ServerStore(tmpDir);
+    const reloadedSearch = reloaded.searchAcrossAllStores('104567890123456789', 'discord_id', true);
+    assert.equal(reloadedSearch.primaryMatches.length, 1);
+    assert.equal(reloadedSearch.relatedMatches.length, 1);
+
+    // Deletion cleans up disk dataset
+    assert.equal(reloaded.deleteDataset('ds_disk_ulp'), true);
+    assert.equal(reloaded.getDatasetById('ds_disk_ulp'), null);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+
 
