@@ -8,6 +8,7 @@ data/secrets.json
 data/users.json
 data/query_logs.json
 data/blocked_attempts.json
+data/blacklist.json
 data/*.ndjson
 data/*.tmp
 .playwright-cli

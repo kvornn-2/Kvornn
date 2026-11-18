@@ -45,7 +45,8 @@ const PORT = Number(process.env.PORT || 3000);
 const distDir = path.resolve(process.cwd(), 'dist');
 const isProduction =
   process.env.NODE_ENV === 'production' ||
-  (process.env.npm_lifecycle_event === 'start' && fs.existsSync(path.join(distDir, 'index.html')));
+  ((process.env.npm_lifecycle_event === 'start' || process.env.RENDER === 'true') &&
+    fs.existsSync(path.join(distDir, 'index.html')));
 const ROOT_ADMIN_EMAILS = new Set(
   (process.env.ROOT_ADMIN_EMAIL || 'icinhack5@gmail.com,anonimhesap6506@gmail.com')
     .split(',')
