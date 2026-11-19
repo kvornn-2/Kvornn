@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 import type {
   AdminOversightData,
   AdminTrackedIpRow,
@@ -1329,6 +1330,7 @@ export class ServerStore {
     if (!ds) throw new Error('Yükleme oturumu bulunamadı.');
     const rawPath = this.getRawUploadPath(datasetId);
     ensureDir(path.dirname(rawPath));
+    let currentSize = 0;
     if (typeof offset === 'number' && Number.isFinite(offset) && offset >= 0) {
       if (!fs.existsSync(rawPath)) {
         fs.writeFileSync(rawPath, Buffer.alloc(0));
@@ -1339,14 +1341,134 @@ export class ServerStore {
       } finally {
         fs.closeSync(fd);
       }
+      currentSize = offset + chunk.length;
     } else {
       fs.appendFileSync(rawPath, chunk);
+      currentSize = fs.statSync(rawPath).size;
     }
-    const currentSize = fs.statSync(rawPath).size;
     if (currentSize > ds.sizeBytes) {
       ds.sizeBytes = currentSize;
     }
-    return currentSize;
+    return Math.max(currentSize, ds.sizeBytes);
+  }
+
+  private runRawIngestionTask(params: {
+    dataDir: string;
+    datasetId: string;
+    datasetName: string;
+    rawFilePath: string;
+    shardPath: string;
+    format: 'json' | 'csv' | 'ndjson' | 'text';
+    columns: string[];
+    mapping: FieldMapping;
+    delimiter?: string;
+    hasHeader?: boolean;
+    isHeterogeneous?: boolean;
+    signal: AbortSignal;
+    onProgress: (processedCount: number, writtenBytes: number) => void;
+  }): Promise<{ recordCount: number; shardBytes: number; columns: string[] }> {
+    if (process.env.DISABLE_INGEST_WORKER === '1') {
+      return analyzeRawFileToDiskDataset({
+        ...params,
+        diskIndex: this.diskIndex,
+      });
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let started = false;
+      let worker: Worker;
+      try {
+        worker = new Worker(new URL('./ingestWorker.ts', import.meta.url), {
+          workerData: {
+            dataDir: params.dataDir,
+            datasetId: params.datasetId,
+            datasetName: params.datasetName,
+            rawFilePath: params.rawFilePath,
+            shardPath: params.shardPath,
+            format: params.format,
+            columns: params.columns,
+            mapping: params.mapping,
+            delimiter: params.delimiter,
+            hasHeader: params.hasHeader,
+            isHeterogeneous: params.isHeterogeneous,
+          },
+        });
+      } catch {
+        // Fallback to in-process async ingestion if worker spawning is unavailable
+        void analyzeRawFileToDiskDataset({ ...params, diskIndex: this.diskIndex }).then(resolve, reject);
+        return;
+      }
+
+      const onAbort = () => {
+        try {
+          worker.postMessage({ type: 'abort' });
+        } catch {
+          void worker.terminate();
+        }
+      };
+      if (params.signal.aborted) {
+        onAbort();
+      } else {
+        params.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      const cleanup = () => {
+        params.signal.removeEventListener('abort', onAbort);
+      };
+
+      worker.on(
+        'message',
+        (msg: {
+          type?: string;
+          recordCount?: number;
+          writtenBytes?: number;
+          result?: { recordCount: number; shardBytes: number; columns: string[] };
+          message?: string;
+        }) => {
+          started = true;
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.type === 'progress' && typeof msg.recordCount === 'number') {
+            params.onProgress(msg.recordCount, msg.writtenBytes || 0);
+          } else if (msg.type === 'done' && msg.result) {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(msg.result);
+          } else if (msg.type === 'error') {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(new Error(msg.message || 'Veri analizi başarısız oldu.'));
+          }
+        },
+      );
+
+      worker.on('error', (err) => {
+        if (settled) return;
+        cleanup();
+        if (!started) {
+          settled = true;
+          void analyzeRawFileToDiskDataset({ ...params, diskIndex: this.diskIndex }).then(resolve, reject);
+          return;
+        }
+        settled = true;
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
+
+      worker.on('exit', (code) => {
+        if (settled) return;
+        cleanup();
+        settled = true;
+        if (params.signal.aborted) {
+          reject(new Error('İçe aktarma iptal edildi.'));
+        } else if (code !== 0) {
+          reject(new Error(`Analiz worker işlemi beklenmedik şekilde sonlandı (kod: ${code}).`));
+        } else {
+          reject(new Error('Analiz worker sonucu alınamadan kapandı.'));
+        }
+      });
+    });
   }
 
   startBackgroundIngestion(
@@ -1384,8 +1506,10 @@ export class ServerStore {
     const shardPath = this.getDatasetShardPath(datasetId);
     const ingestionFormat: 'json' | 'csv' | 'ndjson' | 'text' =
       ds.format === 'synthetic' ? 'text' : ds.format;
+    let lastProgressPersistAt = 0;
 
-    void analyzeRawFileToDiskDataset({
+    void this.runRawIngestionTask({
+      dataDir: this.dataDir,
       datasetId,
       datasetName: ds.name,
       rawFilePath: rawPath,
@@ -1396,13 +1520,16 @@ export class ServerStore {
       delimiter: options.delimiter,
       hasHeader: options.hasHeader,
       isHeterogeneous: options.isHeterogeneous,
-      diskIndex: this.diskIndex,
       signal: controller.signal,
       onProgress: (processedCount) => {
         const live = this.getDatasetById(datasetId);
         if (!live || controller.signal.aborted) return;
         live.recordCount = processedCount;
-        writeJsonFile(this.datasetsFile, this.datasets);
+        const now = Date.now();
+        if (now - lastProgressPersistAt >= 5000) {
+          lastProgressPersistAt = now;
+          writeJsonFile(this.datasetsFile, this.datasets);
+        }
       },
     })
       .then((res) => {
@@ -2190,16 +2317,19 @@ export class ServerStore {
         const baseOffset = fs.existsSync(shardPath) ? fs.statSync(shardPath).size : 0;
         const writer = this.diskIndex.createWriter(4096);
         let cursor = baseOffset;
-        let block = '';
-        for (const rec of prepared) {
-          const line = `${JSON.stringify(rec)}\n`;
-          const len = Buffer.byteLength(line, 'utf8');
-          writer.indexRecord(rec, datasetId, cursor, len);
-          cursor += len;
-          block += line;
+        try {
+          let block = '';
+          for (const rec of prepared) {
+            const line = `${JSON.stringify(rec)}\n`;
+            const len = Buffer.byteLength(line, 'utf8');
+            writer.indexRecord(rec, datasetId, cursor, len);
+            cursor += len;
+            block += line;
+          }
+          fs.appendFileSync(shardPath, block, 'utf8');
+        } finally {
+          writer.close();
         }
-        fs.appendFileSync(shardPath, block, 'utf8');
-        writer.flush();
         addedCount = prepared.length;
         addedBytes = cursor - baseOffset;
       }

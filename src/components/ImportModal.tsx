@@ -30,7 +30,8 @@ interface ImportModalProps {
 }
 
 const SAMPLE_PREVIEW_BYTES = 64 * 1024;
-const RAW_CHUNK_BYTES = 2 * 1024 * 1024;
+const RAW_CHUNK_BYTES = 8 * 1024 * 1024;
+const RAW_UPLOAD_CONCURRENCY = 3;
 const DIRECT_PASTE_MAX_BYTES = 128 * 1024;
 
 function formatByteVolume(bytes: number): string {
@@ -186,18 +187,54 @@ export function ImportModal({
         const datasetId = initRes.dataset.id;
         activeUploadIdRef.current = datasetId;
 
+        const chunkOffsets: number[] = [];
         for (let offset = 0; offset < totalBytes; offset += RAW_CHUNK_BYTES) {
-          if (controller.signal.aborted) {
-            throw new Error(t('Yükleme iptal edildi.', 'Upload cancelled.'));
-          }
-          const slice = sourceBlob.slice(offset, Math.min(totalBytes, offset + RAW_CHUNK_BYTES));
-          await apiAdminUploadChunk(datasetId, slice, offset, controller.signal);
-          setUploadProgress({
-            uploaded: Math.min(totalBytes, offset + slice.size),
-            total: totalBytes,
-            unit: 'bytes',
-          });
+          chunkOffsets.push(offset);
         }
+
+        let nextChunkIdx = 0;
+        let uploadedBytes = 0;
+        const workerCount = Math.min(RAW_UPLOAD_CONCURRENCY, Math.max(1, chunkOffsets.length));
+
+        const uploadWorker = async () => {
+          while (true) {
+            if (controller.signal.aborted) {
+              throw new Error(t('Yükleme iptal edildi.', 'Upload cancelled.'));
+            }
+            const idx = nextChunkIdx;
+            nextChunkIdx += 1;
+            if (idx >= chunkOffsets.length) return;
+
+            const offset = chunkOffsets[idx];
+            const slice = sourceBlob.slice(offset, Math.min(totalBytes, offset + RAW_CHUNK_BYTES));
+
+            let lastErr: unknown;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              if (controller.signal.aborted) {
+                throw new Error(t('Yükleme iptal edildi.', 'Upload cancelled.'));
+              }
+              try {
+                await apiAdminUploadChunk(datasetId, slice, offset, controller.signal);
+                lastErr = null;
+                break;
+              } catch (err) {
+                lastErr = err;
+                if (controller.signal.aborted || attempt === 2) break;
+                await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+              }
+            }
+            if (lastErr) throw lastErr;
+
+            uploadedBytes = Math.min(totalBytes, uploadedBytes + slice.size);
+            setUploadProgress({
+              uploaded: uploadedBytes,
+              total: totalBytes,
+              unit: 'bytes',
+            });
+          }
+        };
+
+        await Promise.all(Array.from({ length: workerCount }, () => uploadWorker()));
 
         const completed = await apiAdminUploadComplete(datasetId, {
           delimiter: parsed.delimiter,

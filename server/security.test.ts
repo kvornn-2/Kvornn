@@ -25,7 +25,24 @@ import { checkDisposableEmail, isDomainInDisposableBlocklist } from './disposabl
 import { runEmailOsint } from './emailOsint.ts';
 import { isValidIpAddress, runIpOsint } from './ipOsint.ts';
 import { ServerStore } from './store.ts';
-import { sanitizeRecordsForQueryResponse } from '../src/utils/search.ts';
+import { DiskIndex, analyzeRawFileToDiskDataset } from './diskIndex.ts';
+import {
+  collectRecordTokens,
+  extractRecordEmails,
+  extractRecordExtraIdentifiers,
+  extractRecordIps,
+  extractRecordPhones,
+  extractRecordSnowflakes,
+  extractRecordUsernames,
+  sanitizeRecordsForQueryResponse,
+} from '../src/utils/search.ts';
+import {
+  buildMappedFieldSet,
+  createCsvColumnPlan,
+  normalizeCsvCellsDirect,
+  normalizeSingleRow,
+} from '../src/utils/parser.ts';
+import type { IntelRecord } from '../src/types/intel.ts';
 import type { Request, Response } from 'express';
 
 test('30-digit admin key generator and verifier enforce strict format and timing-safe match', () => {
@@ -1082,4 +1099,196 @@ test('Zero-dataset Legal IP OSINT validates IPv4/IPv6, isolates private/reserved
   assert.equal(publicReport.version, 4);
   assert.ok(publicReport.pivotLinks.some((l) => l.label === 'RIPEstat'));
   assert.ok(publicReport.pivotLinks.some((l) => l.label === 'Shodan'));
+});
+
+test('collectRecordTokens matches all 6 extractors identically and fast disk ingestion handles mixed, quoted CSV, SQL, and bulk scale accurately', async () => {
+  const rec: IntelRecord = {
+    id: 'parity_1',
+    datasetId: 'ds_parity',
+    datasetName: 'Parity',
+    discordId: '104567890123456789',
+    email: 'Alice.Parity@Example.TEST',
+    username: '@Parity_User',
+    source: 'ForumDump 289104567890123456',
+    ip: '198.51.100.42',
+    phone: '+90 555 234 56 78',
+    notes: 'backup mail: sec.ops@demo.org alt ip 203.0.113.19 phone +90 532 999 88 77',
+    extra: {
+      telegram: '@alice_tg',
+      hwid: 'HWID-99887766',
+      full_name: 'Alice Parity',
+      display_name: 'Alice_Display',
+    },
+  };
+
+  const expected = new Set<string>([
+    ...extractRecordSnowflakes(rec).map((t) => `id:${t}`),
+    ...extractRecordEmails(rec).map((t) => `em:${t}`),
+    ...extractRecordIps(rec).map((t) => `ip:${t}`),
+    ...extractRecordPhones(rec).map((t) => `ph:${t}`),
+    ...extractRecordUsernames(rec).map((t) => `un:${t}`),
+    ...extractRecordExtraIdentifiers(rec).map((t) => `ex:${t}`),
+  ]);
+
+  const actual = new Set<string>();
+  const dedup = new Set<string>();
+  collectRecordTokens(rec, dedup, (tok) => actual.add(tok));
+  assert.deepEqual(Array.from(actual).sort(), Array.from(expected).sort());
+
+  // 0b. Positional normalizeCsvCellsDirect matches normalizeSingleRow identically (including fallback + overflow)
+  const parCols = ['discord_id', 'email', 'username', 'ip', 'phone', 'password', 'created_at', 'raw_meta'];
+  const parMapping = {
+    discordIdField: 'discord_id',
+    emailField: null,
+    usernameField: 'username',
+    sourceField: null,
+    ipField: 'ip',
+    phoneField: null,
+    notesField: null,
+  };
+  const parMapped = buildMappedFieldSet(parMapping);
+  const parPlan = createCsvColumnPlan(parCols, parMapping, parMapped);
+  const parCells = [
+    '104567890123456789',
+    'direct.fallback@example.test',
+    'par_user',
+    '198.51.100.77',
+    '+90 555 888 7766',
+    'Secret123!',
+    '2025-05-01 10:20:30',
+    'info_val',
+    'overflow_col_val',
+  ];
+  const parObj: Record<string, string> = {};
+  for (let c = 0; c < parCells.length; c++) {
+    parObj[parCols[c] || `sutun_${c + 1}`] = parCells[c];
+  }
+  assert.deepEqual(
+    normalizeCsvCellsDirect(parCells, parPlan, parMapped, 'ds_parity', 'Parity', 9, true),
+    normalizeSingleRow(parObj, parMapping, 'ds_parity', 'Parity', 9, parMapped, true),
+  );
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentarika-fast-ingest-'));
+  try {
+    const diskIndex = new DiskIndex(tmpDir);
+    const activeIds = new Set<string>(['ds_fast_csv', 'ds_fast_hetero', 'ds_fast_sql']);
+
+    // 1. Unquoted + Quoted CSV (20,000 rows)
+    const csvPath = path.join(tmpDir, 'raw_csv.csv');
+    const csvLines: string[] = ['discord_id,email,username,ip,phone,source'];
+    for (let i = 0; i < 20_000; i++) {
+      const sf = String(104567890123456789n + BigInt(i));
+      if (i % 50 === 0) {
+        csvLines.push(`"${sf}","quoted.${i}@example.test","user_${i},jr","198.51.100.${(i % 200) + 1}","","Forum, Breach"`);
+      } else {
+        csvLines.push(`${sf},fast.${i}@example.test,fastuser_${i},198.51.100.${(i % 200) + 1},,Archive`);
+      }
+    }
+    fs.writeFileSync(csvPath, csvLines.join('\n'), 'utf8');
+
+    const csvRes = await analyzeRawFileToDiskDataset({
+      datasetId: 'ds_fast_csv',
+      datasetName: 'FastCsv',
+      rawFilePath: csvPath,
+      shardPath: path.join(tmpDir, 'ds_fast_csv.ndjson'),
+      format: 'csv',
+      columns: ['discord_id', 'email', 'username', 'ip', 'phone', 'source'],
+      mapping: {
+        discordIdField: 'discord_id',
+        emailField: 'email',
+        usernameField: 'username',
+        ipField: 'ip',
+        phoneField: 'phone',
+        sourceField: 'source',
+        notesField: null,
+      },
+      delimiter: ',',
+      hasHeader: true,
+      isHeterogeneous: false,
+      diskIndex,
+    });
+    assert.equal(csvRes.recordCount, 20_000);
+
+    // 2. Heterogeneous mixed ULP + JSON line
+    const heteroPath = path.join(tmpDir, 'raw_hetero.txt');
+    fs.writeFileSync(
+      heteroPath,
+      [
+        'https://portal.demo.local/login:104567890123457000:hetero.ulp@example.test:ulp_nick:203.0.113.77',
+        '{"discord_id":"104567890123457001","email":"json.mixed@example.test","username":"json_nick","telegram":"@json_tg"}',
+      ].join('\n'),
+      'utf8',
+    );
+    const heteroRes = await analyzeRawFileToDiskDataset({
+      datasetId: 'ds_fast_hetero',
+      datasetName: 'FastHetero',
+      rawFilePath: heteroPath,
+      shardPath: path.join(tmpDir, 'ds_fast_hetero.ndjson'),
+      format: 'text',
+      columns: ['discord_id', 'email', 'username', 'source', 'ip', 'phone', 'notes'],
+      mapping: {
+        discordIdField: 'discord_id',
+        emailField: 'email',
+        usernameField: 'username',
+        sourceField: 'source',
+        ipField: 'ip',
+        phoneField: 'phone',
+        notesField: 'notes',
+      },
+      isHeterogeneous: true,
+      diskIndex,
+    });
+    assert.equal(heteroRes.recordCount, 2);
+
+    // 3. SQL INSERT dump
+    const sqlPath = path.join(tmpDir, 'raw_dump.sql');
+    fs.writeFileSync(
+      sqlPath,
+      "INSERT INTO `members` (`discord_id`, `email`, `username`) VALUES ('104567890123457002', 'sql.user@example.test', 'sql_nick');",
+      'utf8',
+    );
+    const sqlRes = await analyzeRawFileToDiskDataset({
+      datasetId: 'ds_fast_sql',
+      datasetName: 'FastSql',
+      rawFilePath: sqlPath,
+      shardPath: path.join(tmpDir, 'ds_fast_sql.ndjson'),
+      format: 'text',
+      columns: [],
+      mapping: {
+        discordIdField: 'discord_id',
+        emailField: 'email',
+        usernameField: 'username',
+        sourceField: null,
+        ipField: null,
+        phoneField: null,
+        notesField: null,
+      },
+      diskIndex,
+    });
+    assert.equal(sqlRes.recordCount, 1);
+
+    const resolveShard = (dsId: string) => path.join(tmpDir, `${dsId}.ndjson`);
+
+    // Verify SIMD Buffer lookup resolves across CSV (quoted & fast-path), Hetero ULP/JSON, and SQL
+    const hits = await diskIndex.lookupRecordsAsync(
+      [
+        'id:104567890123456789',
+        'em:quoted.50@example.test',
+        'em:fast.19999@example.test',
+        'id:104567890123457000',
+        'ex:telegram:@json_tg',
+        'em:sql.user@example.test',
+      ],
+      activeIds,
+      resolveShard,
+    );
+    assert.ok(hits.some((r) => r.email === 'fast.0@example.test' || r.email === 'quoted.0@example.test'));
+    assert.ok(hits.some((r) => r.email === 'quoted.50@example.test' && r.username === 'user_50,jr'));
+    assert.ok(hits.some((r) => r.email === 'fast.19999@example.test'));
+    assert.ok(hits.some((r) => r.email === 'hetero.ulp@example.test'));
+    assert.ok(hits.some((r) => r.extra?.telegram === '@json_tg'));
+    assert.ok(hits.some((r) => r.email === 'sql.user@example.test'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

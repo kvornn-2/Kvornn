@@ -3,25 +3,29 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { FieldMapping, IntelRecord } from '../src/types/intel.ts';
 import {
+  classifyRecordDatabaseType,
+  collectRecordTokens,
+} from '../src/utils/search.ts';
+import {
   buildMappedFieldSet,
   cleanInvisibleChars,
+  createCsvColumnPlan,
   flattenObject,
+  isStandardHeteroMapping,
+  normalizeCsvCellsDirect,
   normalizeSingleRow,
-  parseCsvLine,
-  parseMixedSingleLine,
+  parseCsvLineFast,
+  parseMixedLineToIntelRecord,
   splitSqlTuples,
 } from '../src/utils/parser.ts';
-import {
-  classifyRecordDatabaseType,
-  extractRecordEmails,
-  extractRecordExtraIdentifiers,
-  extractRecordIps,
-  extractRecordPhones,
-  extractRecordSnowflakes,
-  extractRecordUsernames,
-} from '../src/utils/search.ts';
 
 const NUM_BUCKETS = 256;
+const NON_ASCII_RE = /[^\x00-\x7f]/;
+const INVISIBLE_CHUNK_TEST_RE = /[\u200B-\u200D\uFEFF]/;
+
+function utf8ByteLengthFast(str: string): number {
+  return NON_ASCII_RE.test(str) ? Buffer.byteLength(str, 'utf8') : str.length;
+}
 
 function fnv1a32(str: string): number {
   let hash = 0x811c9dc5;
@@ -33,20 +37,39 @@ function fnv1a32(str: string): number {
 }
 
 function sanitizeIndexKey(raw: string): string {
-  return raw.replace(/[\t\r\n]/g, ' ').trim();
+  if (!raw) return '';
+  if (raw.indexOf('\t') !== -1 || raw.indexOf('\n') !== -1 || raw.indexOf('\r') !== -1) {
+    return raw.replace(/[\t\r\n]/g, ' ').trim();
+  }
+  return raw.trim();
 }
 
 export class DiskIndexWriter {
   private readonly indexDir: string;
   private readonly buckets: string[][] = Array.from({ length: NUM_BUCKETS }, () => []);
+  private readonly bucketFds = new Int32Array(NUM_BUCKETS).fill(-1);
+  private readonly seenRecordTokens = new Set<string>();
   private bufferedCount = 0;
   private readonly flushThreshold: number;
+  private dirEnsured = false;
 
-  constructor(indexDir: string, flushThreshold = 4096) {
+  constructor(indexDir: string, flushThreshold = 200_000) {
     this.indexDir = indexDir;
     this.flushThreshold = flushThreshold;
     if (!fs.existsSync(this.indexDir)) {
       fs.mkdirSync(this.indexDir, { recursive: true });
+    }
+    this.dirEnsured = true;
+  }
+
+  private addTokenWithMeta(typedKey: string, metaSuffix: string) {
+    const cleanKey = sanitizeIndexKey(typedKey);
+    if (!cleanKey) return;
+    const bucketIdx = fnv1a32(cleanKey) & 0xff;
+    this.buckets[bucketIdx].push(cleanKey + metaSuffix);
+    this.bufferedCount += 1;
+    if (this.bufferedCount >= this.flushThreshold) {
+      this.flush();
     }
   }
 
@@ -62,45 +85,50 @@ export class DiskIndexWriter {
   }
 
   indexRecord(rec: IntelRecord, datasetId: string, byteOffset: number, byteLength: number) {
-    const snowflakes = extractRecordSnowflakes(rec);
-    for (let i = 0; i < snowflakes.length; i++) {
-      this.addToken(`id:${snowflakes[i]}`, datasetId, byteOffset, byteLength);
-    }
-    const emails = extractRecordEmails(rec);
-    for (let i = 0; i < emails.length; i++) {
-      this.addToken(`em:${emails[i]}`, datasetId, byteOffset, byteLength);
-    }
-    const ips = extractRecordIps(rec);
-    for (let i = 0; i < ips.length; i++) {
-      this.addToken(`ip:${ips[i]}`, datasetId, byteOffset, byteLength);
-    }
-    const phones = extractRecordPhones(rec);
-    for (let i = 0; i < phones.length; i++) {
-      this.addToken(`ph:${phones[i]}`, datasetId, byteOffset, byteLength);
-    }
-    const usernames = extractRecordUsernames(rec);
-    for (let i = 0; i < usernames.length; i++) {
-      this.addToken(`un:${usernames[i]}`, datasetId, byteOffset, byteLength);
-    }
-    const extraIds = extractRecordExtraIdentifiers(rec);
-    for (let i = 0; i < extraIds.length; i++) {
-      this.addToken(`ex:${extraIds[i]}`, datasetId, byteOffset, byteLength);
-    }
+    const metaSuffix = `\t${datasetId}\t${byteOffset}\t${byteLength}\n`;
+    collectRecordTokens(rec, this.seenRecordTokens, (typedKey) => {
+      this.addTokenWithMeta(typedKey, metaSuffix);
+    });
   }
 
   flush() {
     if (this.bufferedCount === 0) return;
-    if (!fs.existsSync(this.indexDir)) {
+    if (!this.dirEnsured || !fs.existsSync(this.indexDir)) {
       fs.mkdirSync(this.indexDir, { recursive: true });
+      this.dirEnsured = true;
     }
     for (let b = 0; b < NUM_BUCKETS; b++) {
       const lines = this.buckets[b];
       if (lines.length === 0) continue;
-      const bucketPath = path.join(this.indexDir, `b_${b.toString(16).padStart(2, '0')}.tsv`);
-      fs.appendFileSync(bucketPath, lines.join(''), 'utf8');
+      let fd = this.bucketFds[b];
+      if (fd === -1) {
+        const bucketPath = path.join(this.indexDir, `b_${b.toString(16).padStart(2, '0')}.tsv`);
+        fd = fs.openSync(bucketPath, 'a', 0o600);
+        this.bucketFds[b] = fd;
+      }
+      const payload = Buffer.from(lines.join(''), 'utf8');
+      fs.writeSync(fd, payload, 0, payload.length);
       this.buckets[b] = [];
     }
     this.bufferedCount = 0;
+  }
+
+  close() {
+    try {
+      this.flush();
+    } finally {
+      for (let b = 0; b < NUM_BUCKETS; b++) {
+        const fd = this.bucketFds[b];
+        if (fd !== -1) {
+          this.bucketFds[b] = -1;
+          try {
+            fs.closeSync(fd);
+          } catch {
+            // Ignore close errors
+          }
+        }
+      }
+    }
   }
 }
 
@@ -120,7 +148,7 @@ export class DiskIndex {
     }
   }
 
-  createWriter(flushThreshold = 4096): DiskIndexWriter {
+  createWriter(flushThreshold = 200_000): DiskIndexWriter {
     return new DiskIndexWriter(this.indexDir, flushThreshold);
   }
 
@@ -168,6 +196,35 @@ export class DiskIndex {
     }
   }
 
+  private scanCompleteBufferSlice(
+    activeSlice: Buffer,
+    prefixBufs: Buffer[],
+    activeDatasetIds: Set<string>,
+    seenOffsetKeys: Set<string>,
+    postings: DiskPosting[],
+    maxTotal: number,
+  ): boolean {
+    const sliceLen = activeSlice.length;
+    for (let p = 0; p < prefixBufs.length; p++) {
+      const needle = prefixBufs[p];
+      let pos = 0;
+      while (pos < sliceLen) {
+        const hitIdx = activeSlice.indexOf(needle, pos);
+        if (hitIdx === -1) break;
+        if (hitIdx === 0 || activeSlice[hitIdx - 1] === 0x0a) {
+          const restStart = hitIdx + needle.length;
+          const lineEnd = activeSlice.indexOf(0x0a, restStart);
+          const restEnd = lineEnd !== -1 ? lineEnd : sliceLen;
+          const rest = activeSlice.toString('utf8', restStart, restEnd);
+          this.parsePostingLine(rest, activeDatasetIds, seenOffsetKeys, postings);
+          if (postings.length >= maxTotal) return true;
+        }
+        pos = hitIdx + needle.length;
+      }
+    }
+    return false;
+  }
+
   private scanBucketPrefixesSync(
     bucketIdx: number,
     prefixes: string[],
@@ -179,41 +236,56 @@ export class DiskIndex {
 
     const postings: DiskPosting[] = [];
     const seenOffsetKeys = new Set<string>();
-    const CHUNK_SIZE = 256 * 1024;
-    const buf = Buffer.allocUnsafe(CHUNK_SIZE);
+    const prefixBufs = prefixes.map((p) => Buffer.from(p, 'utf8'));
+    const CHUNK_SIZE = 2 * 1024 * 1024;
+    const CARRY_PAD = 64 * 1024;
+    const buf = Buffer.allocUnsafe(CHUNK_SIZE + CARRY_PAD);
     const fd = fs.openSync(bucketPath, 'r');
-    const decoder = new StringDecoder('utf8');
-    let leftover = '';
+    let carryoverLen = 0;
 
     try {
-      let bytesRead = 0;
-      while ((bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, null)) > 0) {
-        const text = leftover + decoder.write(buf.subarray(0, bytesRead));
-        let start = 0;
-        let nl = text.indexOf('\n', start);
-        while (nl !== -1) {
-          const line = text.slice(start, nl);
-          start = nl + 1;
-          for (let p = 0; p < prefixes.length; p++) {
-            const prefix = prefixes[p];
-            if (line.startsWith(prefix)) {
-              this.parsePostingLine(line.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
-              if (postings.length >= maxTotal) return postings;
-              break;
-            }
-          }
-          nl = text.indexOf('\n', start);
+      while (true) {
+        const maxRead = buf.length - carryoverLen;
+        const readAmt = Math.min(CHUNK_SIZE, maxRead);
+        const bytesRead = fs.readSync(fd, buf, carryoverLen, readAmt, null);
+        if (bytesRead === 0) break;
+
+        const validLen = carryoverLen + bytesRead;
+        const lastNl = buf.lastIndexOf(0x0a, validLen - 1);
+        if (lastNl === -1) {
+          carryoverLen = validLen < buf.length ? validLen : 0;
+          continue;
         }
-        leftover = text.slice(start);
+
+        const activeSlice = buf.subarray(0, lastNl + 1);
+        if (
+          this.scanCompleteBufferSlice(
+            activeSlice,
+            prefixBufs,
+            activeDatasetIds,
+            seenOffsetKeys,
+            postings,
+            maxTotal,
+          )
+        ) {
+          return postings;
+        }
+
+        carryoverLen = validLen - (lastNl + 1);
+        if (carryoverLen > 0) {
+          buf.copy(buf, 0, lastNl + 1, validLen);
+        }
       }
 
-      const tail = (leftover + decoder.end()).trim();
-      if (tail) {
-        for (let p = 0; p < prefixes.length; p++) {
-          const prefix = prefixes[p];
-          if (tail.startsWith(prefix)) {
-            this.parsePostingLine(tail.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
-            break;
+      if (carryoverLen > 0) {
+        const tail = buf.subarray(0, carryoverLen).toString('utf8').trim();
+        if (tail) {
+          for (let p = 0; p < prefixes.length; p++) {
+            const prefix = prefixes[p];
+            if (tail.startsWith(prefix)) {
+              this.parsePostingLine(tail.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
+              break;
+            }
           }
         }
       }
@@ -240,43 +312,57 @@ export class DiskIndex {
 
     const postings: DiskPosting[] = [];
     const seenOffsetKeys = new Set<string>();
-    const CHUNK_SIZE = 256 * 1024;
-    const buf = Buffer.allocUnsafe(CHUNK_SIZE);
-    const decoder = new StringDecoder('utf8');
-    let leftover = '';
+    const prefixBufs = prefixes.map((p) => Buffer.from(p, 'utf8'));
+    const CHUNK_SIZE = 2 * 1024 * 1024;
+    const CARRY_PAD = 64 * 1024;
+    const buf = Buffer.allocUnsafe(CHUNK_SIZE + CARRY_PAD);
+    let carryoverLen = 0;
     let filePos = 0;
 
     try {
       while (true) {
-        const { bytesRead } = await handle.read(buf, 0, CHUNK_SIZE, filePos);
+        const maxRead = buf.length - carryoverLen;
+        const readAmt = Math.min(CHUNK_SIZE, maxRead);
+        const { bytesRead } = await handle.read(buf, carryoverLen, readAmt, filePos);
         if (bytesRead === 0) break;
         filePos += bytesRead;
-        const text = leftover + decoder.write(buf.subarray(0, bytesRead));
-        let start = 0;
-        let nl = text.indexOf('\n', start);
-        while (nl !== -1) {
-          const line = text.slice(start, nl);
-          start = nl + 1;
-          for (let p = 0; p < prefixes.length; p++) {
-            const prefix = prefixes[p];
-            if (line.startsWith(prefix)) {
-              this.parsePostingLine(line.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
-              if (postings.length >= maxTotal) return postings;
-              break;
-            }
-          }
-          nl = text.indexOf('\n', start);
+
+        const validLen = carryoverLen + bytesRead;
+        const lastNl = buf.lastIndexOf(0x0a, validLen - 1);
+        if (lastNl === -1) {
+          carryoverLen = validLen < buf.length ? validLen : 0;
+          continue;
         }
-        leftover = text.slice(start);
+
+        const activeSlice = buf.subarray(0, lastNl + 1);
+        if (
+          this.scanCompleteBufferSlice(
+            activeSlice,
+            prefixBufs,
+            activeDatasetIds,
+            seenOffsetKeys,
+            postings,
+            maxTotal,
+          )
+        ) {
+          return postings;
+        }
+
+        carryoverLen = validLen - (lastNl + 1);
+        if (carryoverLen > 0) {
+          buf.copy(buf, 0, lastNl + 1, validLen);
+        }
       }
 
-      const tail = (leftover + decoder.end()).trim();
-      if (tail) {
-        for (let p = 0; p < prefixes.length; p++) {
-          const prefix = prefixes[p];
-          if (tail.startsWith(prefix)) {
-            this.parsePostingLine(tail.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
-            break;
+      if (carryoverLen > 0) {
+        const tail = buf.subarray(0, carryoverLen).toString('utf8').trim();
+        if (tail) {
+          for (let p = 0; p < prefixes.length; p++) {
+            const prefix = prefixes[p];
+            if (tail.startsWith(prefix)) {
+              this.parsePostingLine(tail.slice(prefix.length), activeDatasetIds, seenOffsetKeys, postings);
+              break;
+            }
           }
         }
       }
@@ -490,7 +576,10 @@ export function indexRecordBatchToDisk(
   records: IntelRecord[],
   appendMode: boolean,
 ): number {
-  if (records.length === 0 && appendMode) return 0;
+  if (records.length === 0 && appendMode) {
+    writer.close();
+    return 0;
+  }
   const dir = path.dirname(shardPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -505,23 +594,27 @@ export function indexRecordBatchToDisk(
   let totalWritten = 0;
   try {
     let cursor = startOffset;
-    const CHUNK = 2000;
+    const CHUNK = 4000;
     for (let i = 0; i < records.length; i += CHUNK) {
-      const slice = records.slice(i, i + CHUNK);
-      let block = '';
-      for (let j = 0; j < slice.length; j++) {
-        const line = `${JSON.stringify(slice[j])}\n`;
-        const lineBytes = Buffer.byteLength(line, 'utf8');
-        writer.indexRecord(slice[j], slice[j].datasetId, cursor, lineBytes);
+      const end = Math.min(records.length, i + CHUNK);
+      const parts: string[] = [];
+      let blockBytes = 0;
+      for (let j = i; j < end; j++) {
+        const rec = records[j];
+        const line = `${JSON.stringify(rec)}\n`;
+        const lineBytes = utf8ByteLengthFast(line);
+        writer.indexRecord(rec, rec.datasetId, cursor, lineBytes);
         cursor += lineBytes;
-        block += line;
+        blockBytes += lineBytes;
+        parts.push(line);
       }
-      totalWritten += Buffer.byteLength(block, 'utf8');
-      fs.writeSync(fd, block, undefined, 'utf8');
+      const payload = Buffer.from(parts.join(''), 'utf8');
+      totalWritten += blockBytes;
+      fs.writeSync(fd, payload, 0, payload.length);
     }
   } finally {
     fs.closeSync(fd);
-    writer.flush();
+    writer.close();
   }
   return totalWritten;
 }
@@ -531,7 +624,7 @@ export function iterateShardRecordsSync(
   onRecord: (rec: IntelRecord) => boolean | void,
 ) {
   if (!fs.existsSync(shardPath)) return;
-  const CHUNK_SIZE = 256 * 1024;
+  const CHUNK_SIZE = 512 * 1024;
   const buf = Buffer.allocUnsafe(CHUNK_SIZE);
   const fd = fs.openSync(shardPath, 'r');
   const decoder = new StringDecoder('utf8');
@@ -614,7 +707,8 @@ export async function analyzeRawFileToDiskDataset(
 
   const colSet = new Set<string>(opts.columns || []);
   const mappedFields = buildMappedFieldSet(mapping);
-  const indexWriter = diskIndex.createWriter(4096);
+  const isStdHetero = isStandardHeteroMapping(mapping);
+  const indexWriter = diskIndex.createWriter(250_000);
 
   const tmpShardPath = `${shardPath}.ingest.tmp`;
   const shardDir = path.dirname(shardPath);
@@ -625,42 +719,46 @@ export async function analyzeRawFileToDiskDataset(
   const outFd = fs.openSync(tmpShardPath, 'w', 0o600);
   let byteCursor = 0;
   let recordCount = 0;
-  let pendingLinesBlock = '';
-  let pendingLineCount = 0;
-  let yieldCounter = 0;
+  let shardChunks: string[] = [];
+  let shardBufferedBytes = 0;
+  let lastProgressAt = performance.now();
+  const SHARD_FLUSH_BYTES = 4 * 1024 * 1024;
 
   const flushShardBlock = () => {
-    if (!pendingLinesBlock) return;
-    fs.writeSync(outFd, pendingLinesBlock, undefined, 'utf8');
-    pendingLinesBlock = '';
-    pendingLineCount = 0;
+    if (shardChunks.length === 0) return;
+    const payload = Buffer.from(shardChunks.join(''), 'utf8');
+    fs.writeSync(outFd, payload, 0, payload.length);
+    shardChunks = [];
+    shardBufferedBytes = 0;
   };
 
-  const emitRecord = (row: Record<string, string>) => {
-    const rec = normalizeSingleRow(row, mapping, datasetId, datasetName, recordCount, mappedFields);
+  const emitNormalizedRecord = (rec: IntelRecord) => {
     const jsonLine = `${JSON.stringify(rec)}\n`;
-    const lineBytes = Buffer.byteLength(jsonLine, 'utf8');
+    const lineBytes = utf8ByteLengthFast(jsonLine);
     indexWriter.indexRecord(rec, datasetId, byteCursor, lineBytes);
     byteCursor += lineBytes;
-    pendingLinesBlock += jsonLine;
-    pendingLineCount += 1;
+    shardChunks.push(jsonLine);
+    shardBufferedBytes += lineBytes;
     recordCount += 1;
-    yieldCounter += 1;
 
-    if (pendingLineCount >= 1000) {
+    if (shardBufferedBytes >= SHARD_FLUSH_BYTES) {
       flushShardBlock();
     }
-    if (recordCount % 2500 === 0) {
-      onProgress?.(recordCount, byteCursor);
+    if ((recordCount & 16383) === 0) {
+      const now = performance.now();
+      if (now - lastProgressAt >= 400) {
+        lastProgressAt = now;
+        onProgress?.(recordCount, byteCursor);
+      }
     }
   };
 
-  const maybeYield = async () => {
-    if (yieldCounter >= 500) {
-      yieldCounter = 0;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+  const emitRow = (row: Record<string, string>, skipInvisibleCheck = false) => {
+    const rec = normalizeSingleRow(row, mapping, datasetId, datasetName, recordCount, mappedFields, skipInvisibleCheck);
+    emitNormalizedRecord(rec);
   };
+
+  const yieldEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
   const handle = await fs.promises.open(rawFilePath, 'r');
   try {
@@ -677,7 +775,7 @@ export async function analyzeRawFileToDiskDataset(
       (peekTrimmed.startsWith('[') ||
         /^\{\s*"(?:data|records|users|items|rows|results|entries)"\s*:\s*\[/i.test(peekTrimmed));
 
-    const READ_CHUNK = 256 * 1024;
+    const READ_CHUNK = 4 * 1024 * 1024;
     const readBuf = Buffer.allocUnsafe(READ_CHUNK);
     const decoder = new StringDecoder('utf8');
     let filePos = 0;
@@ -702,28 +800,31 @@ export async function analyzeRawFileToDiskDataset(
           text = text.replace(/^\uFEFF/, '');
           firstChunk = false;
         }
+        const skipInvis = !INVISIBLE_CHUNK_TEST_RE.test(text);
 
         let segmentStart = 0;
         for (let i = 0; i < text.length; i++) {
-          const ch = text[i];
+          const ch = text.charCodeAt(i);
           if (inStr) {
             if (escaped) escaped = false;
-            else if (ch === '\\') escaped = true;
-            else if (ch === '"') inStr = false;
+            else if (ch === 92) escaped = true; // '\'
+            else if (ch === 34) inStr = false; // '"'
             continue;
           }
-          if (ch === '"') {
+          if (ch === 34) {
             inStr = true;
             continue;
           }
-          if (ch === '{') {
+          if (ch === 123) {
+            // '{'
             depth += 1;
             if (depth === targetDepth && !capturing) {
               capturing = true;
               segmentStart = i;
               objBuffer = '';
             }
-          } else if (ch === '}') {
+          } else if (ch === 125) {
+            // '}'
             if (capturing && depth === targetDepth) {
               objBuffer += text.slice(segmentStart, i + 1);
               capturing = false;
@@ -731,28 +832,31 @@ export async function analyzeRawFileToDiskDataset(
                 const parsed = JSON.parse(objBuffer) as unknown;
                 if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
                   const flat = flattenObject(parsed as Record<string, unknown>);
-                  for (const k of Object.keys(flat)) {
-                    if (colSet.size < 50) colSet.add(k);
+                  if (colSet.size < 50) {
+                    for (const k in flat) {
+                      if (!Object.prototype.hasOwnProperty.call(flat, k)) continue;
+                      colSet.add(k);
+                      if (colSet.size >= 50) break;
+                    }
                   }
-                  emitRecord(flat);
+                  emitRow(flat, skipInvis);
                 }
               } catch {
                 // Skip malformed JSON object
               }
               objBuffer = '';
-              await maybeYield();
             }
             depth = Math.max(0, depth - 1);
           }
         }
         if (capturing) {
           objBuffer += text.slice(segmentStart);
-          // Guard against corrupted unclosed giant token (>16 MB single object)
           if (objBuffer.length > 16 * 1024 * 1024) {
             capturing = false;
             objBuffer = '';
           }
         }
+        await yieldEventLoop();
       }
       decoder.end();
     } else if (isSqlDump) {
@@ -761,7 +865,7 @@ export async function analyzeRawFileToDiskDataset(
       let firstChunk = true;
       const headerRe = /INSERT\s+(?:IGNORE\s+)?INTO\s+[`"\[]?[\w.-]+[`"\]]?(?:\s*\(([^)]+)\))?\s+VALUES\s*/i;
 
-      const processSqlStatement = async (stmt: string) => {
+      const processSqlStatementSync = (stmt: string, skipInvis: boolean) => {
         const match = headerRe.exec(stmt);
         if (!match) return;
         const rawCols = match[1]
@@ -779,10 +883,10 @@ export async function analyzeRawFileToDiskDataset(
           for (let idx = 0; idx < tuple.length; idx++) {
             const colName = (rawCols && rawCols[idx]) || `sutun_${idx + 1}`;
             if (colSet.size < 50) colSet.add(colName);
-            rowObj[colName] = cleanInvisibleChars(tuple[idx] || '');
+            const rawVal = tuple[idx] || '';
+            rowObj[colName] = skipInvis ? rawVal.trim() : cleanInvisibleChars(rawVal);
           }
-          emitRecord(rowObj);
-          await maybeYield();
+          emitRow(rowObj, skipInvis);
         }
       };
 
@@ -797,18 +901,20 @@ export async function analyzeRawFileToDiskDataset(
           firstChunk = false;
         }
         sqlBuffer += text;
+        const skipInvis = !INVISIBLE_CHUNK_TEST_RE.test(sqlBuffer);
 
         let semiIdx = sqlBuffer.indexOf(';');
         while (semiIdx !== -1) {
           const stmt = sqlBuffer.slice(0, semiIdx);
           sqlBuffer = sqlBuffer.slice(semiIdx + 1);
-          await processSqlStatement(stmt);
+          processSqlStatementSync(stmt, skipInvis);
           semiIdx = sqlBuffer.indexOf(';');
         }
+        await yieldEventLoop();
       }
       sqlBuffer += decoder.end();
       if (sqlBuffer.trim()) {
-        await processSqlStatement(sqlBuffer);
+        processSqlStatementSync(sqlBuffer, !INVISIBLE_CHUNK_TEST_RE.test(sqlBuffer));
       }
     } else {
       // Streaming Line-by-Line Reader (CSV, TSV, Colon, ULP, NDJSON, Mixed Text, Logs)
@@ -816,9 +922,12 @@ export async function analyzeRawFileToDiskDataset(
       let lineIndex = 0;
       let firstChunk = true;
       const baseColumns = opts.columns || [];
+      let maxTrackedCols = baseColumns.length;
+      const colPlan = createCsvColumnPlan(baseColumns, mapping, mappedFields);
 
-      const processLine = async (rawLine: string) => {
-        const line = cleanInvisibleChars(rawLine);
+      const processLineSync = (rawLine: string, skipInvis: boolean) => {
+        if (!rawLine) return;
+        const line = skipInvis ? rawLine.trim() : cleanInvisibleChars(rawLine);
         if (!line) return;
         const currentLineNo = lineIndex;
         lineIndex += 1;
@@ -827,16 +936,20 @@ export async function analyzeRawFileToDiskDataset(
           return;
         }
 
-        if (format === 'ndjson' || (line.startsWith('{') && line.endsWith('}'))) {
+        const startsWithBrace = line.charCodeAt(0) === 123;
+        if (format === 'ndjson' || (startsWithBrace && line.charCodeAt(line.length - 1) === 125)) {
           try {
             const obj = JSON.parse(line) as unknown;
             if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
               const flat = flattenObject(obj as Record<string, unknown>);
-              for (const k of Object.keys(flat)) {
-                if (colSet.size < 50) colSet.add(k);
+              if (colSet.size < 50) {
+                for (const k in flat) {
+                  if (!Object.prototype.hasOwnProperty.call(flat, k)) continue;
+                  colSet.add(k);
+                  if (colSet.size >= 50) break;
+                }
               }
-              emitRecord(flat);
-              await maybeYield();
+              emitRow(flat, skipInvis);
               return;
             }
           } catch {
@@ -845,23 +958,47 @@ export async function analyzeRawFileToDiskDataset(
         }
 
         if (isHeterogeneous) {
-          const row = parseMixedSingleLine(line);
-          emitRecord(row);
-          await maybeYield();
+          const rec = parseMixedLineToIntelRecord(
+            line,
+            mapping,
+            datasetId,
+            datasetName,
+            recordCount,
+            isStdHetero,
+            mappedFields,
+            skipInvis,
+          );
+          emitNormalizedRecord(rec);
           return;
         }
 
-        const cells = parseCsvLine(line, delimiter);
-        if (cells.every((c) => !c)) return;
-        const rowObj: Record<string, string> = {};
-        const colCount = Math.max(baseColumns.length, cells.length);
-        for (let c = 0; c < colCount; c++) {
-          const colName = baseColumns[c] || `sutun_${c + 1}`;
-          if (colSet.size < 50) colSet.add(colName);
-          rowObj[colName] = cells[c] ?? '';
+        const cells = parseCsvLineFast(line, delimiter);
+        let anyNonEmpty = false;
+        for (let i = 0; i < cells.length; i++) {
+          if (cells[i]) {
+            anyNonEmpty = true;
+            break;
+          }
         }
-        emitRecord(rowObj);
-        await maybeYield();
+        if (!anyNonEmpty) return;
+
+        if (cells.length > maxTrackedCols && colSet.size < 50) {
+          for (let c = maxTrackedCols; c < cells.length && colSet.size < 50; c++) {
+            colSet.add(`sutun_${c + 1}`);
+          }
+          maxTrackedCols = cells.length;
+        }
+
+        const rec = normalizeCsvCellsDirect(
+          cells,
+          colPlan,
+          mappedFields,
+          datasetId,
+          datasetName,
+          recordCount,
+          skipInvis,
+        );
+        emitNormalizedRecord(rec);
       };
 
       while (true) {
@@ -874,28 +1011,33 @@ export async function analyzeRawFileToDiskDataset(
           text = text.replace(/^\uFEFF/, '');
           firstChunk = false;
         }
+        const skipInvis = !INVISIBLE_CHUNK_TEST_RE.test(text);
 
         let start = 0;
         let nl = text.indexOf('\n', start);
         while (nl !== -1) {
-          let line = text.slice(start, nl);
-          if (line.endsWith('\r')) line = line.slice(0, -1);
+          let lineEnd = nl;
+          if (lineEnd > start && text.charCodeAt(lineEnd - 1) === 13) {
+            lineEnd -= 1;
+          }
+          const line = text.slice(start, lineEnd);
           start = nl + 1;
-          await processLine(line);
+          processLineSync(line, skipInvis);
           nl = text.indexOf('\n', start);
         }
         leftover = text.slice(start);
+        await yieldEventLoop();
       }
 
       const tail = leftover + decoder.end();
       if (tail.trim()) {
-        await processLine(tail);
+        processLineSync(tail, !INVISIBLE_CHUNK_TEST_RE.test(tail));
       }
     }
 
     if (signal?.aborted) throw new Error('İçe aktarma iptal edildi.');
     flushShardBlock();
-    indexWriter.flush();
+    indexWriter.close();
     fs.closeSync(outFd);
     fs.renameSync(tmpShardPath, shardPath);
     onProgress?.(recordCount, byteCursor);
@@ -918,6 +1060,11 @@ export async function analyzeRawFileToDiskDataset(
     }
     throw err;
   } finally {
+    try {
+      indexWriter.close();
+    } catch {
+      // Ignore
+    }
     await handle.close().catch(() => {});
   }
 }

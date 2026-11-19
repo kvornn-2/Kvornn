@@ -208,6 +208,18 @@ function containsExactToken(text: string, token: string): boolean {
   return re.test(trimmed);
 }
 
+function hasAtLeast9Digits(str: string): boolean {
+  let digits = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code >= 48 && code <= 57) {
+      digits += 1;
+      if (digits >= 9) return true;
+    }
+  }
+  return false;
+}
+
 export function normalizePhoneKey(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed || IPV4_TOKEN_RE.test(trimmed)) return '';
@@ -228,24 +240,32 @@ const NON_DISCORD_SNOWFLAKE_EXTRA_KEY_RE =
 export function extractRecordSnowflakes(rec: IntelRecord): string[] {
   const out = new Set<string>();
   const addFromText = (txt: string) => {
-    if (!txt) return;
+    if (!txt || txt.length < 17) return;
     const matches = txt.match(SNOWFLAKE_TOKEN_RE);
     if (!matches) return;
-    for (const m of matches) {
+    for (let i = 0; i < matches.length; i++) {
+      const m = matches[i];
       if (isValidSnowflake(m)) out.add(m);
     }
   };
-  if (rec.discordId.trim()) {
-    if (isValidSnowflake(rec.discordId.trim())) out.add(rec.discordId.trim());
+  const direct = rec.discordId.trim();
+  if (direct) {
+    if (isValidSnowflake(direct)) out.add(direct);
     else addFromText(rec.discordId);
   }
   addFromText(rec.username);
   addFromText(rec.source);
   addFromText(rec.notes);
-  for (const [k, val] of Object.entries(rec.extra || {})) {
-    const cleanKey = k.trim().toLowerCase().replace(/[\s-]+/g, '_');
-    if (NON_DISCORD_SNOWFLAKE_EXTRA_KEY_RE.test(cleanKey)) continue;
-    addFromText(val);
+  const extra = rec.extra;
+  if (extra) {
+    for (const k in extra) {
+      if (!Object.prototype.hasOwnProperty.call(extra, k)) continue;
+      const val = extra[k];
+      if (!val || val.length < 17) continue;
+      const cleanKey = k.trim().toLowerCase().replace(/[\s-]+/g, '_');
+      if (NON_DISCORD_SNOWFLAKE_EXTRA_KEY_RE.test(cleanKey)) continue;
+      addFromText(val);
+    }
   }
   return Array.from(out);
 }
@@ -253,19 +273,23 @@ export function extractRecordSnowflakes(rec: IntelRecord): string[] {
 export function extractRecordEmails(rec: IntelRecord): string[] {
   const out = new Set<string>();
   const addFromText = (txt: string) => {
-    if (!txt) return;
+    if (!txt || txt.indexOf('@') === -1) return;
     const matches = txt.match(EMAIL_TOKEN_RE);
     if (!matches) return;
-    for (const m of matches) {
-      out.add(m.toLowerCase());
+    for (let i = 0; i < matches.length; i++) {
+      out.add(matches[i].toLowerCase());
     }
   };
-  if (rec.email.trim()) addFromText(rec.email);
+  addFromText(rec.email);
   addFromText(rec.username);
   addFromText(rec.source);
   addFromText(rec.notes);
-  for (const val of Object.values(rec.extra || {})) {
-    addFromText(val);
+  const extra = rec.extra;
+  if (extra) {
+    for (const k in extra) {
+      if (!Object.prototype.hasOwnProperty.call(extra, k)) continue;
+      addFromText(extra[k]);
+    }
   }
   return Array.from(out);
 }
@@ -273,10 +297,11 @@ export function extractRecordEmails(rec: IntelRecord): string[] {
 export function extractRecordIps(rec: IntelRecord): string[] {
   const out = new Set<string>();
   const addFromText = (txt: string) => {
-    if (!txt) return;
+    if (!txt || txt.length < 7 || txt.indexOf('.') === -1) return;
     const matches = txt.match(IPV4_TOKEN_RE);
     if (!matches) return;
-    for (const ip of matches) {
+    for (let i = 0; i < matches.length; i++) {
+      const ip = matches[i];
       if (isCorrelatableIp(ip)) out.add(ip);
     }
   };
@@ -286,8 +311,12 @@ export function extractRecordIps(rec: IntelRecord): string[] {
     else addFromText(direct);
   }
   addFromText(rec.notes);
-  for (const val of Object.values(rec.extra || {})) {
-    addFromText(val);
+  const extra = rec.extra;
+  if (extra) {
+    for (const k in extra) {
+      if (!Object.prototype.hasOwnProperty.call(extra, k)) continue;
+      addFromText(extra[k]);
+    }
   }
   return Array.from(out);
 }
@@ -297,22 +326,30 @@ const NON_PHONE_EXTRA_KEY_RE =
 
 export function extractRecordPhones(rec: IntelRecord): string[] {
   const out = new Set<string>();
-  const directKey = normalizePhoneKey(rec.phone);
-  if (directKey) out.add(directKey);
+  if (rec.phone) {
+    const directKey = normalizePhoneKey(rec.phone);
+    if (directKey) out.add(directKey);
+  }
   const scanText = (txt: string) => {
-    if (!txt || isTimestampLikeValue(txt)) return;
+    if (!txt || txt.length < 9 || !hasAtLeast9Digits(txt) || isTimestampLikeValue(txt)) return;
     const matches = txt.match(PHONE_CANDIDATE_RE);
     if (!matches) return;
-    for (const m of matches) {
-      const k = normalizePhoneKey(m);
+    for (let i = 0; i < matches.length; i++) {
+      const k = normalizePhoneKey(matches[i]);
       if (k) out.add(k);
     }
   };
   scanText(rec.notes);
-  for (const [key, val] of Object.entries(rec.extra || {})) {
-    const cleanKey = key.trim().toLowerCase().replace(/[\s-]+/g, '_');
-    if (NON_PHONE_EXTRA_KEY_RE.test(cleanKey)) continue;
-    scanText(val);
+  const extra = rec.extra;
+  if (extra) {
+    for (const key in extra) {
+      if (!Object.prototype.hasOwnProperty.call(extra, key)) continue;
+      const val = extra[key];
+      if (!val || val.length < 9) continue;
+      const cleanKey = key.trim().toLowerCase().replace(/[\s-]+/g, '_');
+      if (NON_PHONE_EXTRA_KEY_RE.test(cleanKey)) continue;
+      scanText(val);
+    }
   }
   return Array.from(out);
 }
@@ -344,25 +381,55 @@ const GENERIC_JUNK_VALUES = new Set([
   'undefined',
 ]);
 
+function isValidUsernameToken(raw: string): boolean {
+  return (
+    raw.length >= 4 &&
+    !GENERIC_JUNK_VALUES.has(raw) &&
+    !/^\d+$/.test(raw) &&
+    !/^[0-9a-f]{4,6}$/.test(raw) &&
+    raw.indexOf('@') === -1
+  );
+}
+
+function canonicalExtraKey(key: string): string {
+  return key === 'ad_soyad' || key === 'isim_soyisim' || key === 'full_name'
+    ? 'full_name'
+    : key === 'adres' || key === 'ev_adresi' || key === 'address'
+      ? 'address'
+      : key === 'tc' || key === 'tckn' || key === 'tc_no' || key === 'kimlik'
+        ? 'national_id'
+        : key === 'tg' || key === 'telegram'
+          ? 'telegram'
+          : key === 'ig' || key === 'instagram'
+            ? 'instagram'
+            : key === 'hw_id' || key === 'hwid'
+              ? 'hwid'
+              : key === 'mac_address' || key === 'mac'
+                ? 'mac'
+                : key === 'steamid' || key === 'steam_id' || key === 'steam'
+                  ? 'steam_id'
+                  : key === 'roblox_id' || key === 'roblox'
+                    ? 'roblox_id'
+                    : key;
+}
+
 export function extractRecordUsernames(rec: IntelRecord): string[] {
   const out = new Set<string>();
   const addUser = (rawVal: string) => {
+    if (!rawVal || rawVal.length < 4) return;
     const raw = rawVal.trim().replace(/^@/, '').toLowerCase();
-    // Require >= 4 chars and exclude pure numbers or short hex fragments (e.g. ff0, bac5, 67c)
-    if (
-      raw.length >= 4 &&
-      !GENERIC_JUNK_VALUES.has(raw) &&
-      !/^\d+$/.test(raw) &&
-      !/^[0-9a-f]{4,6}$/.test(raw) &&
-      !raw.includes('@')
-    ) {
+    if (isValidUsernameToken(raw)) {
       out.add(raw);
     }
   };
   addUser(rec.username);
-  for (const [k, v] of Object.entries(rec.extra || {})) {
-    if (EXTRA_USERNAME_KEY_RE.test(k.trim())) {
-      addUser(String(v || ''));
+  const extra = rec.extra;
+  if (extra) {
+    for (const k in extra) {
+      if (!Object.prototype.hasOwnProperty.call(extra, k)) continue;
+      if (EXTRA_USERNAME_KEY_RE.test(k.trim())) {
+        addUser(String(extra[k] || ''));
+      }
     }
   }
   return Array.from(out);
@@ -370,37 +437,167 @@ export function extractRecordUsernames(rec: IntelRecord): string[] {
 
 export function extractRecordExtraIdentifiers(rec: IntelRecord): string[] {
   const out = new Set<string>();
-  for (const [rawKey, rawVal] of Object.entries(rec.extra || {})) {
+  const extra = rec.extra;
+  if (!extra) return [];
+  for (const rawKey in extra) {
+    if (!Object.prototype.hasOwnProperty.call(extra, rawKey)) continue;
     const key = rawKey.trim().toLowerCase();
     if (!HIGH_SIGNAL_EXTRA_KEY_RE.test(key)) continue;
-    const val = String(rawVal || '').trim().toLowerCase();
+    const val = String(extra[rawKey] || '').trim().toLowerCase();
     if (val.length < 4 || GENERIC_JUNK_VALUES.has(val)) continue;
     if ((key === 'full_name' || key === 'ad_soyad' || key === 'isim_soyisim') && !/\s+/.test(val) && val.length < 8) {
       continue;
     }
-    const canonicalKey =
-      key === 'ad_soyad' || key === 'isim_soyisim' || key === 'full_name'
-        ? 'full_name'
-        : key === 'adres' || key === 'ev_adresi' || key === 'address'
-          ? 'address'
-          : key === 'tc' || key === 'tckn' || key === 'tc_no' || key === 'kimlik'
-            ? 'national_id'
-            : key === 'tg' || key === 'telegram'
-              ? 'telegram'
-              : key === 'ig' || key === 'instagram'
-                ? 'instagram'
-                : key === 'hw_id' || key === 'hwid'
-                  ? 'hwid'
-                  : key === 'mac_address' || key === 'mac'
-                    ? 'mac'
-                    : key === 'steamid' || key === 'steam_id' || key === 'steam'
-                      ? 'steam_id'
-                      : key === 'roblox_id' || key === 'roblox'
-                        ? 'roblox_id'
-                        : key;
-    out.add(`${canonicalKey}:${val}`);
+    out.add(`${canonicalExtraKey(key)}:${val}`);
   }
   return Array.from(out);
+}
+
+/**
+ * Single-pass zero-Set-allocation token extractor for high-throughput disk indexing.
+ * Emits exact same typed tokens (`id:`, `em:`, `ip:`, `ph:`, `un:`, `ex:`) as the 6 individual extractors.
+ */
+export function collectRecordTokens(
+  rec: IntelRecord,
+  dedupSet: Set<string>,
+  emit: (typedKey: string) => void,
+): void {
+  dedupSet.clear();
+
+  const emitOnce = (typedKey: string) => {
+    if (!dedupSet.has(typedKey)) {
+      dedupSet.add(typedKey);
+      emit(typedKey);
+    }
+  };
+
+  const scanSnowflakes = (txt: string) => {
+    if (!txt || txt.length < 17) return;
+    const matches = txt.match(SNOWFLAKE_TOKEN_RE);
+    if (!matches) return;
+    for (let i = 0; i < matches.length; i++) {
+      const m = matches[i];
+      if (isValidSnowflake(m)) emitOnce(`id:${m}`);
+    }
+  };
+
+  const scanEmails = (txt: string) => {
+    if (!txt || txt.indexOf('@') === -1) return;
+    const matches = txt.match(EMAIL_TOKEN_RE);
+    if (!matches) return;
+    for (let i = 0; i < matches.length; i++) {
+      emitOnce(`em:${matches[i].toLowerCase()}`);
+    }
+  };
+
+  const scanIpv4s = (txt: string) => {
+    if (!txt || txt.length < 7 || txt.indexOf('.') === -1) return;
+    const matches = txt.match(IPV4_TOKEN_RE);
+    if (!matches) return;
+    for (let i = 0; i < matches.length; i++) {
+      const ip = matches[i];
+      if (isCorrelatableIp(ip)) emitOnce(`ip:${ip}`);
+    }
+  };
+
+  const scanPhones = (txt: string) => {
+    if (!txt || txt.length < 9 || !hasAtLeast9Digits(txt) || isTimestampLikeValue(txt)) return;
+    const matches = txt.match(PHONE_CANDIDATE_RE);
+    if (!matches) return;
+    for (let i = 0; i < matches.length; i++) {
+      const pk = normalizePhoneKey(matches[i]);
+      if (pk) emitOnce(`ph:${pk}`);
+    }
+  };
+
+  const addUser = (rawVal: string) => {
+    if (!rawVal || rawVal.length < 4) return;
+    const raw = rawVal.trim().replace(/^@/, '').toLowerCase();
+    if (isValidUsernameToken(raw)) {
+      emitOnce(`un:${raw}`);
+    }
+  };
+
+  if (rec.discordId) {
+    const directId = rec.discordId.trim();
+    if (directId) {
+      if (isValidSnowflake(directId)) emitOnce(`id:${directId}`);
+      else scanSnowflakes(rec.discordId);
+    }
+  }
+
+  if (rec.email) scanEmails(rec.email);
+
+  if (rec.ip) {
+    const directIp = rec.ip.trim().toLowerCase();
+    if (directIp && isCorrelatableIp(directIp)) {
+      if (directIp.includes(':') && /^[0-9a-f:]+$/.test(directIp)) {
+        emitOnce(`ip:${directIp}`);
+      } else {
+        scanIpv4s(directIp);
+      }
+    }
+  }
+
+  if (rec.phone) {
+    const pk = normalizePhoneKey(rec.phone);
+    if (pk) emitOnce(`ph:${pk}`);
+  }
+
+  if (rec.username) {
+    addUser(rec.username);
+    scanSnowflakes(rec.username);
+    scanEmails(rec.username);
+  }
+
+  if (rec.source) {
+    scanSnowflakes(rec.source);
+    scanEmails(rec.source);
+  }
+
+  if (rec.notes) {
+    scanSnowflakes(rec.notes);
+    scanEmails(rec.notes);
+    scanIpv4s(rec.notes);
+    scanPhones(rec.notes);
+  }
+
+  const extra = rec.extra;
+  if (extra) {
+    for (const rawKey in extra) {
+      if (!Object.prototype.hasOwnProperty.call(extra, rawKey)) continue;
+      const valStr = extra[rawKey];
+      if (!valStr) continue;
+
+      const keyTrim = rawKey.trim();
+      const keyLower = keyTrim.toLowerCase();
+      const cleanKey = keyLower.indexOf(' ') !== -1 || keyLower.indexOf('-') !== -1
+        ? keyLower.replace(/[\s-]+/g, '_')
+        : keyLower;
+
+      if (valStr.length >= 17 && !NON_DISCORD_SNOWFLAKE_EXTRA_KEY_RE.test(cleanKey)) {
+        scanSnowflakes(valStr);
+      }
+      scanEmails(valStr);
+      scanIpv4s(valStr);
+      if (valStr.length >= 9 && !NON_PHONE_EXTRA_KEY_RE.test(cleanKey)) {
+        scanPhones(valStr);
+      }
+      if (EXTRA_USERNAME_KEY_RE.test(keyTrim)) {
+        addUser(valStr);
+      }
+      if (HIGH_SIGNAL_EXTRA_KEY_RE.test(keyLower)) {
+        const normVal = String(valStr).trim().toLowerCase();
+        if (
+          normVal.length >= 4 &&
+          !GENERIC_JUNK_VALUES.has(normVal) &&
+          !((keyLower === 'full_name' || keyLower === 'ad_soyad' || keyLower === 'isim_soyisim') && !/\s+/.test(normVal) && normVal.length < 8)
+        ) {
+          emitOnce(`ex:${canonicalExtraKey(keyLower)}:${normVal}`);
+        }
+      }
+    }
+  }
 }
 
 export function hasConflictingDiscordId(
