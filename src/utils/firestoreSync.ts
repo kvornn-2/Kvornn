@@ -115,6 +115,7 @@ export interface CloudBackupSnapshot {
   queryLogs: QueryAuditLog[];
   blockedAttempts: BlockedRegistrationAttempt[];
   deletedDatasetIds?: string[];
+  omittedLargeDatasets?: Array<{ id: string; name: string; recordCount: number; sizeBytes: number }>;
 }
 
 const ROLE_DOC_ID: Record<StandardRole, 'uye' | 'destekci' | 'isletme'> = {
@@ -129,9 +130,50 @@ function sanitizeChunkId(raw: string): string {
 
 let cloudVerifiedUid: string | null = null;
 
+export function formatCloudSyncError(err: unknown): string {
+  const rawMsg = err instanceof Error ? err.message : String(err || '');
+  let innerError = rawMsg;
+  try {
+    const parsed = JSON.parse(rawMsg) as { error?: string; operationType?: string; path?: string };
+    if (parsed && typeof parsed.error === 'string') {
+      innerError = parsed.error;
+    }
+  } catch {
+    // Plain error message
+  }
+
+  const lower = innerError.toLowerCase();
+  const host = typeof window !== 'undefined' ? window.location.hostname : '';
+
+  if (lower.includes('auth/unauthorized-domain')) {
+    return `Bu alan adı (${host || 'mevcut domain'}) Firebase yetkili alan adları listesinde değil. Firebase Console > Authentication > Settings > Authorized domains bölümüne ekleyin.`;
+  }
+  if (lower.includes('auth/popup-blocked')) {
+    return 'Tarayıcı Google hesap seçimi penceresini engelledi. Lütfen açılır pencerelere (pop-up) izin verip tekrar deneyin.';
+  }
+  if (lower.includes('auth/popup-closed-by-user') || lower.includes('auth/cancelled-popup-request')) {
+    return 'Google hesap seçim penceresi tamamlanmadan kapatıldı.';
+  }
+  if (lower.includes('permission-denied') || lower.includes('missing or insufficient permissions')) {
+    return 'Firestore erişim izni reddedildi. Seçilen Google hesabının Yönetici yetkili e-posta listesinde (doğrulanmış Gmail) olduğundan emin olun.';
+  }
+  if (lower.includes('resource-exhausted') || lower.includes('quota')) {
+    return 'Firestore günlük yazma veya okuma kotası geçici olarak aşıldı.';
+  }
+  if (lower.includes('invalid-argument') || lower.includes('exceeds the maximum allowed size')) {
+    return 'Firestore belge veya paket boyut sınırı aşıldı. Çok büyük depolar için Tam Yedek Kasası (.json) kullanın.';
+  }
+  return innerError || 'Bulut eşitlemesi sırasında beklenmeyen bir hata oluştu.';
+}
+
 export function isCloudRootAdminConnected(): boolean {
   const u = auth.currentUser;
   return Boolean(u && u.emailVerified && cloudVerifiedUid && u.uid === cloudVerifiedUid);
+}
+
+export function getConnectedCloudAdminEmail(): string | null {
+  if (!isCloudRootAdminConnected()) return null;
+  return auth.currentUser?.email || null;
 }
 
 export async function verifyExistingCloudSession(
@@ -159,49 +201,66 @@ export async function verifyExistingCloudSession(
 
 export async function connectAdminGoogleAccount(
   authorizeOnServer: (idToken: string) => Promise<{ authorized: boolean }>,
-): Promise<{ uid: string; authorized: boolean }> {
+): Promise<{ uid: string; email: string; authorized: boolean }> {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
-  const cred = await signInWithPopup(auth, provider);
-  if (!cred.user.emailVerified) {
-    throw new Error('Doğrulanmış bir hesap seçilmelidir.');
+  try {
+    const cred = await signInWithPopup(auth, provider);
+    if (!cred.user.emailVerified) {
+      throw new Error('Doğrulanmış bir Google hesabı seçilmelidir.');
+    }
+    const idToken = await cred.user.getIdToken(true);
+    const res = await authorizeOnServer(idToken);
+    if (!res.authorized) {
+      throw new Error('Seçilen Google hesabı bu Yönetici bulut kasası için yetkili değil.');
+    }
+    cloudVerifiedUid = cred.user.uid;
+    return { uid: cred.user.uid, email: cred.user.email || '', authorized: true };
+  } catch (err) {
+    throw new Error(formatCloudSyncError(err));
   }
-  const idToken = await cred.user.getIdToken(true);
-  const res = await authorizeOnServer(idToken);
-  if (!res.authorized) {
-    throw new Error('Seçilen hesap bu bulut kasası için yetkili değil.');
-  }
-  cloudVerifiedUid = cred.user.uid;
-  return { uid: cred.user.uid, authorized: true };
 }
+
+const utf8Encoder = new TextEncoder();
 
 function buildSafeRecordChunks(
   datasetId: string,
   records: IntelRecord[],
 ): Array<{ chunkId: string; datasetId: string; chunkIndex: number; totalChunks: number; records: IntelRecord[] }> {
   const dsId = sanitizeChunkId(datasetId);
-  const MAX_RECORDS = 250;
-  const MAX_BYTES = 420_000;
+  const MAX_RECORDS = 150;
+  const MAX_BYTES = 240_000;
 
   const grouped: IntelRecord[][] = [];
   let current: IntelRecord[] = [];
   let currentBytes = 0;
 
   for (const r of records) {
+    const safeExtra: Record<string, string> = {};
+    if (r.extra && typeof r.extra === 'object') {
+      let extraCount = 0;
+      for (const [k, v] of Object.entries(r.extra)) {
+        if (extraCount >= 40) break;
+        const cleanKey = String(k).slice(0, 60);
+        if (!cleanKey) continue;
+        safeExtra[cleanKey] = String(v ?? '').slice(0, 1200);
+        extraCount += 1;
+      }
+    }
     const clean: IntelRecord = {
-      id: r.id.slice(0, 120),
+      id: String(r.id || '').slice(0, 120) || `${dsId}_${grouped.length}_${current.length}`,
       datasetId: dsId,
-      datasetName: (r.datasetName || 'Dataset').slice(0, 120),
-      discordId: (r.discordId || '').slice(0, 32),
-      email: (r.email || '').slice(0, 180),
-      username: (r.username || '').slice(0, 80),
-      source: (r.source || '').slice(0, 120),
-      ip: (r.ip || '').slice(0, 64),
-      phone: (r.phone || '').slice(0, 40),
-      notes: (r.notes || '').slice(0, 1500),
-      extra: r.extra || {},
+      datasetName: String(r.datasetName || 'Dataset').slice(0, 120) || 'Dataset',
+      discordId: String(r.discordId || '').slice(0, 32),
+      email: String(r.email || '').slice(0, 180),
+      username: String(r.username || '').slice(0, 80),
+      source: String(r.source || '').slice(0, 120),
+      ip: String(r.ip || '').slice(0, 64),
+      phone: String(r.phone || '').slice(0, 40),
+      notes: String(r.notes || '').slice(0, 1200),
+      extra: safeExtra,
     };
-    const estBytes = JSON.stringify(clean).length;
+    const estBytes = utf8Encoder.encode(JSON.stringify(clean)).length;
     if (current.length > 0 && (current.length >= MAX_RECORDS || currentBytes + estBytes > MAX_BYTES)) {
       grouped.push(current);
       current = [];
@@ -283,9 +342,19 @@ async function pushRolesToFirestore(roles: RoleConfigMap): Promise<number> {
 
 async function pushUsersToFirestore(users: ServerCloudUser[]): Promise<number> {
   let written = 0;
+  const validUsers = users.filter(
+    (u) =>
+      u &&
+      typeof u.email === 'string' &&
+      u.email.length >= 3 &&
+      typeof u.passwordHash === 'string' &&
+      u.passwordHash.length >= 10 &&
+      typeof u.username === 'string' &&
+      /^[a-zA-Z0-9_.-]{3,32}$/.test(u.username),
+  );
   try {
-    for (let i = 0; i < users.length; i += 100) {
-      const slice = users.slice(i, i + 100);
+    for (let i = 0; i < validUsers.length; i += 100) {
+      const slice = validUsers.slice(i, i + 100);
       const existingCreatedMap = new Map<string, unknown>();
       await Promise.all(
         slice.map(async (u) => {
@@ -299,16 +368,22 @@ async function pushUsersToFirestore(users: ServerCloudUser[]): Promise<number> {
       const userBatch = writeBatch(db);
       for (const u of slice) {
         const uid = sanitizeChunkId(u.googleUid || u.id);
+        const safeUserId =
+          u.id && u.id.startsWith('usr_') && /^[a-zA-Z0-9_-]{5,128}$/.test(u.id)
+            ? u.id
+            : sanitizeChunkId(`usr_${uid}`).slice(0, 128);
+        const safeRole: StandardRole =
+          u.role === 'Destekçi' || u.role === 'İşletme' ? u.role : 'Üye';
         userBatch.set(doc(db, 'users', uid), {
-          id: u.id.slice(0, 128),
+          id: safeUserId,
           uid,
           username: u.username.slice(0, 32),
-          displayName: (u.displayName || u.username).slice(0, 80),
-          role: u.role,
+          displayName: (u.displayName || u.username || 'uye').slice(0, 80) || 'uye',
+          role: safeRole,
           emailVerified: Boolean(u.emailVerified),
           banned: Boolean(u.banned),
           banReason: (u.banReason || '').slice(0, 240),
-          dailyUsed: Math.max(0, Math.floor(u.dailyUsed || 0)),
+          dailyUsed: Math.min(1_000_000, Math.max(0, Math.floor(u.dailyUsed || 0))),
           usageDate: (u.usageDate || '').slice(0, 16),
           createdAt: existingCreatedMap.get(uid) ?? serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -592,10 +667,30 @@ export async function autoSyncCloudWithServer(
 
   // 6. Push new or modified datasets (bounded for Firebase Spark free tier) and clean up stale chunks
   const MAX_FREE_FIRESTORE_RECORDS_PER_DATASET = 12500;
+  const MAX_FREE_FIRESTORE_SIZE_BYTES = 104_857_600;
+  const byDatasetAll = new Map<string, IntelRecord[]>();
+  for (const r of serverSnap.records) {
+    const dsId = sanitizeChunkId(r.datasetId);
+    const list = byDatasetAll.get(dsId);
+    if (list) list.push(r);
+    else byDatasetAll.set(dsId, [r]);
+  }
+
   let uploadedDatasets = 0;
   const datasetsToUpload = serverSnap.datasets.filter((ds) => {
+    if (
+      ds.ingestionStatus === 'uploading' ||
+      ds.ingestionStatus === 'analyzing' ||
+      ds.ingestionStatus === 'error'
+    ) {
+      return false;
+    }
     if (ds.recordCount > MAX_FREE_FIRESTORE_RECORDS_PER_DATASET) return false;
+    if ((ds.sizeBytes || 0) > MAX_FREE_FIRESTORE_SIZE_BYTES) return false;
     const cleanId = sanitizeChunkId(ds.id);
+    const availableCount = byDatasetAll.get(cleanId)?.length ?? 0;
+    if (ds.recordCount > 0 && availableCount === 0) return false;
+
     const existing = fsDatasetMap.get(cleanId);
     return (
       !existing ||
@@ -614,15 +709,17 @@ export async function autoSyncCloudWithServer(
         const dsBatch = writeBatch(db);
         for (const ds of slice) {
           const dsId = sanitizeChunkId(ds.id);
+          const recsForDs = byDatasetAll.get(dsId) || [];
+          const safeCount = Math.min(1_000_000, Math.max(0, Math.floor(recsForDs.length || ds.recordCount)));
           dsBatch.set(doc(db, 'datasets', dsId), {
             id: dsId,
-            name: ds.name.slice(0, 120),
+            name: (ds.name || 'Dataset').slice(0, 120) || 'Dataset',
             category: ds.category || 'both',
-            format: ds.format,
-            recordCount: Math.max(0, Math.floor(ds.recordCount)),
-            columns: (ds.columns || []).slice(0, 50).map((c) => String(c).slice(0, 60)),
+            format: ['json', 'csv', 'ndjson', 'text', 'synthetic'].includes(ds.format) ? ds.format : 'text',
+            recordCount: safeCount,
+            columns: (ds.columns || []).slice(0, 50).map((c) => String(c).slice(0, 60)).filter(Boolean),
             importedAt: (ds.importedAt || '').slice(0, 64),
-            sizeBytes: Math.max(0, Math.floor(ds.sizeBytes || 0)),
+            sizeBytes: Math.min(MAX_FREE_FIRESTORE_SIZE_BYTES, Math.max(0, Math.floor(ds.sizeBytes || 0))),
             updatedAt: serverTimestamp(),
           });
         }
@@ -632,29 +729,19 @@ export async function autoSyncCloudWithServer(
       handleFirestoreError(err, OperationType.WRITE, 'datasets');
     }
 
-    const byDataset = new Map<string, IntelRecord[]>();
-    const uploadIds = new Set(datasetsToUpload.map((d) => sanitizeChunkId(d.id)));
-    for (const r of serverSnap.records) {
-      const dsId = sanitizeChunkId(r.datasetId);
-      if (!uploadIds.has(dsId)) continue;
-      const list = byDataset.get(dsId);
-      if (list) list.push(r);
-      else byDataset.set(dsId, [r]);
-    }
-
     const chunkEntries: ReturnType<typeof buildSafeRecordChunks> = [];
     const newChunkCountByDs = new Map<string, number>();
     for (const ds of datasetsToUpload) {
       const dsId = sanitizeChunkId(ds.id);
-      const recs = byDataset.get(dsId) || [];
+      const recs = byDatasetAll.get(dsId) || [];
       const built = buildSafeRecordChunks(dsId, recs);
       newChunkCountByDs.set(dsId, built.length);
       chunkEntries.push(...built);
     }
 
     try {
-      for (let i = 0; i < chunkEntries.length; i += 15) {
-        const batchSlice = chunkEntries.slice(i, i + 15);
+      for (let i = 0; i < chunkEntries.length; i += 6) {
+        const batchSlice = chunkEntries.slice(i, i + 6);
         const chunkBatch = writeBatch(db);
         for (const ch of batchSlice) {
           chunkBatch.set(doc(db, 'dataset_chunks', ch.chunkId), {

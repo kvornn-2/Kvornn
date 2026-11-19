@@ -12,6 +12,8 @@ data/users.json
 data/query_logs.json
 data/blocked_attempts.json
 data/blacklist.json
+data/admin_ips.json
+data/index/
 data/*.ndjson
 data/*.tmp
 .playwright-cli/

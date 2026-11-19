@@ -222,6 +222,9 @@ export function normalizePhoneKey(raw: string): string {
   return digits.length >= 10 ? digits.slice(-10) : digits;
 }
 
+const NON_DISCORD_SNOWFLAKE_EXTRA_KEY_RE =
+  /^(steam|steam_id|steamid|roblox|roblox_id|tc|tckn|tc_no|kimlik|ssn|passport|iban|phone|tel|gsm|mobile|phone2|tel2|gsm2|secondary_phone|order_id|invoice_id|transaction_id|tx_id|card|hwid|hw_id|device_id|mac|mac_address|serial|uuid|guid|wallet|timestamp|created_at|updated_at|registered_at|last_seen|last_login|port|size|bytes|count|record_count)$/i;
+
 export function extractRecordSnowflakes(rec: IntelRecord): string[] {
   const out = new Set<string>();
   const addFromText = (txt: string) => {
@@ -239,7 +242,9 @@ export function extractRecordSnowflakes(rec: IntelRecord): string[] {
   addFromText(rec.username);
   addFromText(rec.source);
   addFromText(rec.notes);
-  for (const val of Object.values(rec.extra || {})) {
+  for (const [k, val] of Object.entries(rec.extra || {})) {
+    const cleanKey = k.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (NON_DISCORD_SNOWFLAKE_EXTRA_KEY_RE.test(cleanKey)) continue;
     addFromText(val);
   }
   return Array.from(out);

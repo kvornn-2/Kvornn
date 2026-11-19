@@ -91,8 +91,8 @@ export function EmailOsintView({
           </h2>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
             {t(
-              'DNS / MX / SPF / DMARC ve RDAP altyapısının yanında XposedOrNot, LeakCheck, Hudson Rock Cavalier, ProxyNova COMB, Proton/OpenPGP, Gravatar, GitHub ve açık sızıntı indekslerinde eşzamanlı tarama yapar.',
-              'Simultaneously queries XposedOrNot, LeakCheck, Hudson Rock Cavalier, ProxyNova COMB, Proton/OpenPGP, Gravatar, GitHub, plus DNS / MX / SPF / DMARC & RDAP infrastructure.',
+              'DNS / MX / SPF / DMARC / BIMI / MTA-STS ve RDAP altyapısının yanında XposedOrNot, LeakCheck, Hudson Rock Cavalier, ProxyNova COMB, Proton/OpenPGP, Ubuntu Keyserver, GitHub, GitLab, npm, Microsoft 365 ve yüklü arşiv kayıtlarında eşzamanlı derin tarama yapar.',
+              'Simultaneously queries XposedOrNot, LeakCheck, Hudson Rock Cavalier, ProxyNova COMB, Proton/OpenPGP, Ubuntu Keyserver, GitHub, GitLab, npm, Microsoft 365, uploaded archives, plus DNS / MX / SPF / DMARC / BIMI / MTA-STS & RDAP.',
             )}
           </p>
         </div>
@@ -137,13 +137,23 @@ export function EmailOsintView({
             <span className="font-semibold text-slate-900 dark:text-slate-100">
               {t('Hedef:', 'Target:')} <span className="font-mono">{report.email}</span>
             </span>
+            {report.identitySummary && report.identitySummary.canonicalEmail !== report.email.toLowerCase() && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>
+                  {t('Kanonik:', 'Canonical:')} <span className="font-mono">{report.identitySummary.canonicalEmail}</span>
+                </span>
+              </>
+            )}
             <span aria-hidden="true">·</span>
             <span>{report.mailProvider}</span>
             <span aria-hidden="true">·</span>
             <span>
               {report.isDisposable
                 ? t('Geçici / Tek Kullanımlık Alan Adı', 'Disposable Domain')
-                : t('Standart Alan Adı', 'Standard Domain')}
+                : report.identitySummary?.isRoleAddress
+                  ? t('Rol Bazlı Kurumsal Adres', 'Role-Based Address')
+                  : t('Standart Alan Adı', 'Standard Domain')}
             </span>
             <span aria-hidden="true">·</span>
             <span className="font-semibold text-blue-600 dark:text-blue-400">
@@ -154,15 +164,40 @@ export function EmailOsintView({
           </div>
 
           <section className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111827]">
-            <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
-              {t('Alan Adı ve Posta Sunucusu Altyapısı', 'Domain & Mail Infrastructure')} ({report.domain})
-            </h3>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
+                {t('Alan Adı ve Posta Sunucusu Altyapısı', 'Domain & Mail Infrastructure')} ({report.domain})
+              </h3>
+              {report.identitySummary && (
+                <span
+                  className={`rounded border px-2 py-0.5 text-[11px] font-semibold ${
+                    report.identitySummary.spoofingRisk === 'low'
+                      ? 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/35 dark:text-emerald-300'
+                      : report.identitySummary.spoofingRisk === 'medium'
+                        ? 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/35 dark:text-amber-300'
+                        : 'border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/35 dark:text-red-300'
+                  }`}
+                >
+                  {t('Spoofing Riski:', 'Spoofing Risk:')}{' '}
+                  {report.identitySummary.spoofingRisk === 'low'
+                    ? t('Düşük', 'Low')
+                    : report.identitySummary.spoofingRisk === 'medium'
+                      ? t('Orta', 'Medium')
+                      : t('Yüksek', 'High')}
+                </span>
+              )}
+            </div>
             <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <div>
                 <div className="text-xs text-slate-500 dark:text-slate-400">{t('Posta Sağlayıcısı', 'Mail Provider')}</div>
                 <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-slate-100">
                   {report.mailProvider}
                 </div>
+                {report.identitySummary?.microsoftTenant && (
+                  <div className="mt-1 font-mono text-[11px] text-blue-600 dark:text-blue-400">
+                    M365 Tenant: {report.identitySummary.microsoftTenant}
+                  </div>
+                )}
               </div>
               <div>
                 <div className="text-xs text-slate-500 dark:text-slate-400">{t('MX Kayıtları', 'MX Records')}</div>
@@ -173,10 +208,16 @@ export function EmailOsintView({
                 </div>
               </div>
               <div>
-                <div className="text-xs text-slate-500 dark:text-slate-400">{t('SPF / DMARC Güvenliği', 'SPF / DMARC Security')}</div>
-                <div className="mt-1 text-xs text-slate-800 dark:text-slate-200">
+                <div className="text-xs text-slate-500 dark:text-slate-400">{t('SPF / DMARC / BIMI / MTA-STS', 'SPF / DMARC / BIMI / MTA-STS')}</div>
+                <div className="mt-1 space-y-0.5 text-xs text-slate-800 dark:text-slate-200">
                   <div>SPF: {report.spfRecord ? t('Tanımlı', 'Configured') : t('Bulunamadı', 'Missing')}</div>
                   <div>DMARC: {report.dmarcRecord ? t('Tanımlı', 'Configured') : t('Bulunamadı', 'Missing')}</div>
+                  {report.identitySummary && (
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                      BIMI: {report.identitySummary.bimiRecord ? t('Var', 'Yes') : t('Yok', 'No')} · MTA-STS:{' '}
+                      {report.identitySummary.mtaStsRecord ? t('Var', 'Yes') : t('Yok', 'No')}
+                    </div>
+                  )}
                 </div>
               </div>
               <div>
@@ -198,6 +239,120 @@ export function EmailOsintView({
               </div>
             </div>
           </section>
+
+          {report.identitySummary &&
+            (report.identitySummary.discoveredNames.length > 0 ||
+              report.identitySummary.discoveredUsernames.length > 0 ||
+              report.identitySummary.discoveredEmails.length > 0 ||
+              report.identitySummary.discoveredLocations.length > 0 ||
+              report.identitySummary.localExposedSignals.passwords.length > 0 ||
+              report.identitySummary.localExposedSignals.tokens.length > 0 ||
+              report.identitySummary.localExposedSignals.ips.length > 0 ||
+              report.identitySummary.localExposedSignals.phones.length > 0 ||
+              report.identitySummary.localExposedSignals.discordIds.length > 0 ||
+              report.identitySummary.localExposedSignals.hwids.length > 0) && (
+              <section
+                data-testid="email-osint-identity-summary"
+                className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111827]"
+              >
+                <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  {t('Birleşik OSINT Kimlik Özeti ve Çapraz Sinyaller', 'Unified OSINT Identity Summary & Cross-Signals')}
+                </h3>
+                <div className="mt-3 grid grid-cols-1 gap-4 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                  {report.identitySummary.discoveredNames.length > 0 && (
+                    <div>
+                      <div className="text-slate-500 dark:text-slate-400">{t('Tespit Edilen İsimler', 'Discovered Names')}</div>
+                      <ul className="mt-1 space-y-0.5 font-medium text-slate-900 dark:text-slate-100">
+                        {report.identitySummary.discoveredNames.map((n) => (
+                          <li key={n} className="truncate">{n}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {report.identitySummary.discoveredUsernames.length > 0 && (
+                    <div>
+                      <div className="text-slate-500 dark:text-slate-400">{t('Kullanıcı Adları', 'Usernames')}</div>
+                      <ul className="mt-1 space-y-0.5 font-mono text-slate-900 dark:text-slate-100">
+                        {report.identitySummary.discoveredUsernames.map((u) => (
+                          <li key={u} className="truncate">@{u}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {report.identitySummary.discoveredEmails.length > 0 && (
+                    <div>
+                      <div className="text-slate-500 dark:text-slate-400">{t('İlişkili E-postalar', 'Associated Emails')}</div>
+                      <ul className="mt-1 space-y-0.5 font-mono text-blue-600 dark:text-blue-400">
+                        {report.identitySummary.discoveredEmails.map((em) => (
+                          <li key={em} className="truncate">{em}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {report.identitySummary.discoveredLocations.length > 0 && (
+                    <div>
+                      <div className="text-slate-500 dark:text-slate-400">{t('Konum / Şirket', 'Locations / Orgs')}</div>
+                      <ul className="mt-1 space-y-0.5 text-slate-900 dark:text-slate-100">
+                        {report.identitySummary.discoveredLocations.map((loc) => (
+                          <li key={loc} className="truncate">{loc}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+
+                {(report.identitySummary.localExposedSignals.passwords.length > 0 ||
+                  report.identitySummary.localExposedSignals.tokens.length > 0 ||
+                  report.identitySummary.localExposedSignals.ips.length > 0 ||
+                  report.identitySummary.localExposedSignals.phones.length > 0 ||
+                  report.identitySummary.localExposedSignals.discordIds.length > 0 ||
+                  report.identitySummary.localExposedSignals.hwids.length > 0) && (
+                  <div className="mt-4 border-t border-slate-200 pt-3 dark:border-slate-800">
+                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+                      {t('Yüklü Arşiv Verilerinden Çıkarılan Hassas Alanlar', 'Sensitive Signals Extracted From Uploaded Archives')}
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
+                      {report.identitySummary.localExposedSignals.passwords.length > 0 && (
+                        <div className="rounded-lg border border-slate-200 bg-slate-50 p-2.5 dark:border-slate-800 dark:bg-slate-900/60">
+                          <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                            {t('Parola / Hash', 'Passwords / Hashes')} ({report.identitySummary.localExposedSignals.passwords.length})
+                          </div>
+                          <div className="mt-1 space-y-0.5 font-mono text-rose-600 dark:text-rose-400">
+                            {report.identitySummary.localExposedSignals.passwords.slice(0, 6).map((pw, idx) => (
+                              <div key={idx} className="truncate" title={pw}>{pw}</div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {report.identitySummary.localExposedSignals.tokens.length > 0 && (
+                        <div className="rounded-lg border border-slate-200 bg-slate-50 p-2.5 dark:border-slate-800 dark:bg-slate-900/60">
+                          <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                            {t('Token / Anahtar', 'Tokens / Keys')} ({report.identitySummary.localExposedSignals.tokens.length})
+                          </div>
+                          <div className="mt-1 space-y-0.5 font-mono text-amber-700 dark:text-amber-300">
+                            {report.identitySummary.localExposedSignals.tokens.slice(0, 4).map((tok, idx) => (
+                              <div key={idx} className="truncate" title={tok}>{tok}</div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {report.identitySummary.localExposedSignals.hwids.length > 0 && (
+                        <div className="rounded-lg border border-slate-200 bg-slate-50 p-2.5 dark:border-slate-800 dark:bg-slate-900/60">
+                          <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                            HWID ({report.identitySummary.localExposedSignals.hwids.length})
+                          </div>
+                          <div className="mt-1 space-y-0.5 font-mono text-slate-900 dark:text-slate-100">
+                            {report.identitySummary.localExposedSignals.hwids.slice(0, 5).map((h, idx) => (
+                              <div key={idx} className="truncate" title={h}>{h}</div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
 
           <section className="space-y-3">
             <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">

@@ -20,6 +20,7 @@ export function TopBar({
   const tabTitles: Record<ActiveTab, string> = {
     lookup: t('ID Sorgu', 'ID Lookup'),
     email_osint: t('E-posta OSINT', 'Email OSINT'),
+    ip_osint: t('IP Sorgu (Yasal OSINT)', 'IP Lookup (Legal OSINT)'),
     bulk: t('Toplu Sorgu', 'Bulk Lookup'),
     profile: t('Profilim', 'My Profile'),
     admin: t('Admin Paneli', 'Admin Panel'),

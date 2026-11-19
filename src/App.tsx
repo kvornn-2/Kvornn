@@ -14,6 +14,7 @@ import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
 import { LookupView } from './components/LookupView';
 import { EmailOsintView } from './components/EmailOsintView';
+import { IpOsintView } from './components/IpOsintView';
 import { BulkLookupView } from './components/BulkLookupView';
 import { ProfileView } from './components/ProfileView';
 import { LegalDisclaimerView } from './components/LegalDisclaimerView';
@@ -37,8 +38,10 @@ import {
 import {
   auth as firebaseAuth,
   autoSyncCloudWithServer,
+  formatCloudSyncError,
   isCloudRootAdminConnected,
   verifyExistingCloudSession,
+  type AutoSyncResult,
 } from './utils/firestoreSync';
 
 const AdminView = lazy(() =>
@@ -69,6 +72,7 @@ function AppShell() {
   const [authChecked, setAuthChecked] = useState(false);
   const [cloudSyncStatus, setCloudSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'needs_google' | 'error'>('idle');
   const [cloudSyncDetail, setCloudSyncDetail] = useState<string | null>(null);
+  const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
   const syncInFlightRef = useRef(false);
   const bootSyncedRef = useRef(false);
 
@@ -171,11 +175,17 @@ function AppShell() {
     serverAdminVerified &&
       currentUser &&
       currentUser.role === 'Admin' &&
-      currentUser.id === 'admin_root' &&
+      (currentUser.id === 'admin_root' || currentUser.id === 'manager_root') &&
       isTokenConsistentWithUser(getStoredToken(), currentUser),
   );
 
-  // Immediately terminate tampered client sessions if role/tab is forced without an authentic admin_root token
+  const isRootManager = Boolean(
+    isVerifiedAdmin &&
+      currentUser?.id === 'manager_root' &&
+      currentUser?.isRootManager === true,
+  );
+
+  // Immediately terminate tampered client sessions if role/tab is forced without an authentic admin/manager token
   useEffect(() => {
     if (!currentUser) return;
     const token = getStoredToken();
@@ -186,15 +196,25 @@ function AppShell() {
   }, [currentUser, activeTab, importOpen, serverAdminVerified, isVerifiedAdmin, handleLogout]);
 
   const runCloudSync = useCallback(
-    async (opts: { restoreMissing?: boolean; pushRoles?: boolean; forceDatasetIds?: string[] } = {}) => {
-      if (!isVerifiedAdmin) return;
+    async (opts: { restoreMissing?: boolean; pushRoles?: boolean; forceDatasetIds?: string[] } = {}): Promise<{
+      ok: boolean;
+      error?: string;
+      result?: AutoSyncResult;
+    }> => {
+      if (!isRootManager) {
+        return { ok: false };
+      }
       if (!isCloudRootAdminConnected()) {
         setCloudSyncStatus('needs_google');
-        return;
+        setCloudSyncError(null);
+        return { ok: false, error: t('Önce yetkili Google hesabını bağlayın.', 'Connect an authorized Google account first.') };
       }
-      if (syncInFlightRef.current) return;
+      if (syncInFlightRef.current) {
+        return { ok: true };
+      }
       syncInFlightRef.current = true;
       setCloudSyncStatus('syncing');
+      setCloudSyncError(null);
       try {
         const res = await autoSyncCloudWithServer(
           apiAdminExportCloudSnapshot,
@@ -206,40 +226,45 @@ function AppShell() {
           setDatasetRevision((r) => r + 1);
           setCloudSyncDetail(
             t(
-              `Buluttan otomatik geri yüklendi (+${res.restoredDatasets} depo, +${res.restoredUsers} üye).`,
-              `Auto-restored from cloud (+${res.restoredDatasets} datasets, +${res.restoredUsers} users).`,
+              `Buluttan geri yüklendi: +${res.restoredDatasets} depo, +${res.restoredRecords} kayıt, +${res.restoredUsers} üye.`,
+              `Restored from cloud: +${res.restoredDatasets} datasets, +${res.restoredRecords} records, +${res.restoredUsers} users.`,
             ),
           );
         } else if (res.uploadedDatasets > 0) {
           setCloudSyncDetail(
             t(
-              `Yeni veriler buluta otomatik yedeklendi (+${res.uploadedDatasets} depo).`,
-              `New datasets auto-backed up to cloud (+${res.uploadedDatasets}).`,
+              `Yeni veriler buluta yedeklendi (+${res.uploadedDatasets} depo).`,
+              `New datasets backed up to cloud (+${res.uploadedDatasets}).`,
             ),
           );
         } else {
           setCloudSyncDetail(
             t(
-              'Tüm depolar, üyeler ve rol yetkileri arka planda otomatik korunur; sunucu yeniden başlasa dahi silinmez.',
-              'All datasets, members, and role permissions are backed up & restored automatically across server restarts.',
+              'Bulut eşitliği güncel. 12.500 kayıt altındaki depolar, tüm üyeler ve rol hakları sunucu yeniden başlasa bile otomatik geri yüklenir.',
+              'Cloud sync is up to date. Datasets under 12,500 records, members, and roles auto-restore across restarts.',
             ),
           );
         }
         setCloudSyncStatus('synced');
-      } catch {
+        return { ok: true, result: res };
+      } catch (err) {
+        const readable = formatCloudSyncError(err);
         setCloudSyncStatus('error');
+        setCloudSyncError(readable);
+        return { ok: false, error: readable };
       } finally {
         syncInFlightRef.current = false;
       }
     },
-    [isVerifiedAdmin, refreshStats, t],
+    [isRootManager, refreshStats, t],
   );
 
   useEffect(() => {
-    if (!isVerifiedAdmin) {
+    if (!isRootManager) {
       bootSyncedRef.current = false;
       setCloudSyncStatus('idle');
       setCloudSyncDetail(null);
+      setCloudSyncError(null);
       return;
     }
     const unsub = onAuthStateChanged(firebaseAuth, () => {
@@ -256,7 +281,7 @@ function AppShell() {
       })();
     });
     return () => unsub();
-  }, [isVerifiedAdmin, runCloudSync]);
+  }, [isRootManager, runCloudSync]);
 
   const handleRunSearch = async (overrideQuery?: string) => {
     const activeQ = (overrideQuery !== undefined ? overrideQuery : query).trim();
@@ -392,6 +417,14 @@ function AppShell() {
             />
           )}
 
+          {activeTab === 'ip_osint' && (
+            <IpOsintView
+              currentUser={currentUser}
+              onUserUpdate={(u) => setCurrentUser(freezePublicUser(u))}
+              onUnauthorized={handleLogout}
+            />
+          )}
+
           {activeTab === 'bulk' && (
             <BulkLookupView
               currentUser={currentUser}
@@ -418,6 +451,7 @@ function AppShell() {
                 refreshSignal={datasetRevision}
                 cloudSyncStatus={cloudSyncStatus}
                 cloudSyncDetail={cloudSyncDetail}
+                cloudSyncError={cloudSyncError}
                 onRequestCloudSync={runCloudSync}
               />
             </Suspense>

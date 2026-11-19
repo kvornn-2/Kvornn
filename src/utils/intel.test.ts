@@ -720,7 +720,7 @@ test('Conflicting foreign Discord IDs sharing CDN IPs, shared IPs, timestamp-lik
   const idx = buildSearchIndex(pool);
   const res = searchRecords(pool, '701810803321471176', 'discord_id', true, pool, idx);
 
-  assert.equal(res.primaryMatches.length, 2);
+  assert.equal(res.primaryMatches.length, 3);
   const relatedIds = res.relatedMatches.map((r) => r.id).sort();
   assert.deepEqual(relatedIds, ['unattributed_hwid', 'unattributed_real_phone']);
   // Conflicting foreign Discord IDs sharing CF IP, shared residential IP, dummy phone, or short hex "ff0" are excluded

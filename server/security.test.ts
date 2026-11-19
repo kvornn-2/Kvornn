@@ -17,10 +17,13 @@ import {
   signSessionToken,
   verifyAdminKey,
   verifyAdminSessionClaim,
+  verifyManagerSessionClaim,
   verifyPassword,
   verifySessionToken,
 } from './security.ts';
 import { checkDisposableEmail, isDomainInDisposableBlocklist } from './disposable.ts';
+import { runEmailOsint } from './emailOsint.ts';
+import { isValidIpAddress, runIpOsint } from './ipOsint.ts';
 import { ServerStore } from './store.ts';
 import { sanitizeRecordsForQueryResponse } from '../src/utils/search.ts';
 import type { Request, Response } from 'express';
@@ -682,6 +685,401 @@ test('Async scrypt auth, shared-IP per-user rate limiter, parallel disk queries,
   }
 });
 
+test('Hybrid memory+disk search blocks CDN/weak IP cross-ID leaks and sanitizeRecordsForQueryResponse hides dataset origin & cleans legacy timestamp phones', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentarika-hybrid-iso-'));
+  try {
+    const store = new ServerStore(tmpDir);
 
+    // 1. Seed in-memory dataset with target Discord ID + Cloudflare IP + legacy timestamp inside phone
+    store.addDataset(
+      {
+        id: 'ds_mem_part',
+        name: 'data_part2',
+        category: 'both',
+        format: 'csv',
+        recordCount: 2,
+        columns: ['discordId', 'username', 'ip', 'phone', 'source'],
+        mapping: {
+          discordIdField: 'discordId',
+          emailField: null,
+          usernameField: 'username',
+          sourceField: 'source',
+          ipField: 'ip',
+          phoneField: 'phone',
+          notesField: null,
+        },
+        importedAt: new Date().toISOString(),
+        sizeBytes: 256,
+      },
+      [
+        {
+          id: 'mem_target_1',
+          datasetId: 'ds_mem_part',
+          datasetName: 'data_part2',
+          discordId: '701810803321471176',
+          email: '',
+          username: '53775969',
+          source: 'data-2',
+          ip: '172.70.51.219',
+          phone: '2025-07-26 19:17:38',
+          notes: '',
+          extra: {},
+        },
+        {
+          id: 'mem_foreign_cf',
+          datasetId: 'ds_mem_part',
+          datasetName: 'data_part2',
+          discordId: '289104567890123456',
+          email: 'stranger.cf@example.test',
+          username: 'ff0',
+          source: 'data_part2.csv',
+          ip: '172.70.51.219',
+          phone: '2025-07-26 19:17:38',
+          notes: '',
+          extra: {},
+        },
+      ],
+    );
 
+    // 2. Seed disk-backed dataset containing a foreign Discord ID on same CF IP AND an unattributed email-linked record
+    const rawDisk = [
+      '999888777666555444:foreign.disk@example.test:ff0:172.70.51.219',
+      '701810803321471176:real.owner@example.test:owner_nick:198.51.100.88',
+      '05551112233:real.owner@example.test:shop_buyer:203.0.113.12',
+    ].join('\n');
+    const diskBuf = Buffer.from(rawDisk, 'utf8');
+    store.initRawUploadDataset({
+      id: 'ds_disk_part',
+      name: 'legacymedya&yunusbey id data',
+      format: 'text',
+      sizeBytes: diskBuf.length,
+      columns: ['id', 'email', 'username', 'ip'],
+      mapping: {
+        discordIdField: null,
+        emailField: null,
+        usernameField: null,
+        sourceField: null,
+        ipField: null,
+        phoneField: null,
+        notesField: null,
+      },
+    });
+    store.appendRawUploadChunk('ds_disk_part', diskBuf, 0);
+    store.startBackgroundIngestion('ds_disk_part', { delimiter: ':', hasHeader: false, isHeterogeneous: true });
 
+    for (let i = 0; i < 60; i++) {
+      const cur = store.getDatasetById('ds_disk_part');
+      if (cur?.ingestionStatus === 'ready') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const res = await store.searchAcrossAllStoresAsync('701810803321471176', 'discord_id', true);
+    const allMatched = [...res.primaryMatches, ...res.relatedMatches];
+
+    // No foreign Discord ID leaked via Cloudflare IP (172.70.51.219), timestamp phone, or hex username "ff0"
+    assert.equal(allMatched.some((r) => r.discordId && r.discordId !== '701810803321471176'), false);
+    assert.equal(res.primaryMatches.length, 2);
+    assert.equal(res.relatedMatches.length, 1);
+    assert.equal(res.relatedMatches[0].email, 'real.owner@example.test');
+
+    // sanitizeRecordsForQueryResponse strips datasetId, datasetName, filename-like sources (data-2 / data_part2.csv), and moves timestamp phone -> extra.tarih
+    const sanitized = sanitizeRecordsForQueryResponse(allMatched);
+    for (const r of sanitized) {
+      assert.equal(r.datasetId, '');
+      assert.equal(r.datasetName, '');
+      assert.equal(r.source, '');
+    }
+    const memTargetSanitized = sanitized.find((r) => r.id === 'mem_target_1');
+    assert.ok(memTargetSanitized);
+    assert.equal(memTargetSanitized.phone, '');
+    assert.equal(memTargetSanitized.extra.tarih, '2025-07-26 19:17:38');
+    const genuinePhoneRec = sanitized.find((r) => r.discordId === '');
+    assert.ok(genuinePhoneRec);
+    assert.equal(genuinePhoneRec.phone, '05551112233');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Two-tier Admin vs Manager (Yönetici Key): Admins leave zero trace in queryLogs, Manager inspects & bans Admin IPs and rotates Admin key', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sentarika-manager-'));
+  try {
+    // Seed legacy query_logs.json containing an exposed Sistem Yöneticisi entry + IP
+    const legacyLogs = [
+      {
+        id: 'q_legacy_admin',
+        userId: 'admin_root',
+        username: 'Sistem Yöneticisi',
+        queryType: 'id_lookup',
+        target: '701810803321471176',
+        matchCount: 5,
+        ip: '203.0.113.200',
+        timestamp: new Date().toISOString(),
+      },
+      {
+        id: 'q_member_1',
+        userId: 'usr_normal_1',
+        username: 'ali_member',
+        queryType: 'id_lookup',
+        target: '104567890123456789',
+        matchCount: 1,
+        ip: '198.51.100.44',
+        timestamp: new Date().toISOString(),
+      },
+    ];
+    fs.writeFileSync(path.join(tmpDir, 'query_logs.json'), JSON.stringify(legacyLogs, null, 2), 'utf8');
+
+    const store = new ServerStore(tmpDir);
+
+    // 1. Legacy Sistem Yöneticisi log + IP was purged on startup, while normal user log remains
+    const logs = store.getQueryAuditLogs();
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].username, 'ali_member');
+
+    // 2. Appending new admin_root / manager_root / Sistem Yöneticisi audit entries is silently ignored
+    store.appendQueryAuditLog({
+      userId: 'admin_root',
+      username: 'Sistem Yöneticisi',
+      queryType: 'id_lookup',
+      target: '123',
+      matchCount: 0,
+      ip: '198.51.100.9',
+    });
+    store.appendQueryAuditLog({
+      userId: 'manager_root',
+      username: 'Yönetici',
+      queryType: 'email_osint',
+      target: 'a@b.com',
+      matchCount: 0,
+      ip: '198.51.100.1',
+    });
+    assert.equal(store.getQueryAuditLogs().length, 1);
+
+    // 3. Existing admin key hash and separate manager key hash both initialize cleanly
+    const initialAdminHash = store.getAdminKeyHash();
+    const managerHash = store.getManagerKeyHash();
+    assert.match(initialAdminHash, /^[0-9a-f]{64}$/);
+    assert.match(managerHash, /^[0-9a-f]{64}$/);
+    assert.notEqual(initialAdminHash, managerHash);
+
+    // 4. Manager claim verifier strictly separates manager_root from admin_root
+    const mEpoch = store.getManagerTokenEpoch();
+    assert.equal(
+      verifyManagerSessionClaim(
+        { userId: 'manager_root', role: 'Admin', exp: Date.now() + 60_000, managerGrant: true, managerEpoch: mEpoch },
+        mEpoch,
+      ),
+      true,
+    );
+    assert.equal(
+      verifyManagerSessionClaim(
+        {
+          userId: 'admin_root',
+          role: 'Admin',
+          exp: Date.now() + 60_000,
+          adminGrant: true,
+          adminEpoch: store.getAdminTokenEpoch(),
+        },
+        mEpoch,
+      ),
+      false,
+    );
+
+    // 5. Tracking Admin IPs works for Manager oversight ONLY, and Admin IP ban revokes token epoch
+    store.recordAdminIpActivity('203.0.113.77', 'login');
+    store.recordAdminIpActivity('203.0.113.77', 'query');
+    assert.equal(store.listAllUsersForAdmin().some((u) => u.id === 'admin_root' || u.id === 'manager_root'), false);
+
+    const oldEpoch = store.getAdminTokenEpoch();
+    const afterIpBan = store.setAdminIpBan('203.0.113.77', true, 'Yetkisiz IP');
+    assert.equal(afterIpBan.trackedIps.find((r) => r.ip === '203.0.113.77')?.banned, true);
+    assert.equal(afterIpBan.trackedIps.find((r) => r.ip === '203.0.113.77')?.queryCount, 1);
+    assert.equal(store.isAdminBlockedForIp('203.0.113.77').blocked, true);
+    assert.equal(store.isAdminBlockedForIp('203.0.113.78').blocked, false);
+    assert.notEqual(store.getAdminTokenEpoch(), oldEpoch);
+
+    store.setAdminIpBan('203.0.113.77', false);
+    assert.equal(store.isAdminBlockedForIp('203.0.113.77').blocked, false);
+
+    // 6. Global Admin ban blocks every IP
+    store.setAdminGlobalBan(true, 'Bakım');
+    assert.equal(store.isAdminBlockedForIp('203.0.113.78').blocked, true);
+    store.setAdminGlobalBan(false);
+    assert.equal(store.isAdminBlockedForIp('203.0.113.78').blocked, false);
+
+    // 7. Auto-reset Admin Key generates valid 30-digit CSPRNG key, updates hash + epoch, and persists across restart
+    const epochBeforeReset = store.getAdminTokenEpoch();
+    const rotated = store.resetOrUploadAdminKey();
+    assert.match(rotated.adminKey, /^\d{30}$/);
+    assert.equal(verifyAdminKey(rotated.adminKey, store.getAdminKeyHash()), true);
+    assert.notEqual(store.getAdminKeyHash(), initialAdminHash);
+    assert.notEqual(store.getAdminTokenEpoch(), epochBeforeReset);
+
+    const reloaded = new ServerStore(tmpDir);
+    assert.equal(reloaded.getAdminKeyHash(), store.getAdminKeyHash());
+    assert.equal(verifyAdminKey(rotated.adminKey, reloaded.getAdminKeyHash()), true);
+
+    // 8. Root Manager has full Admin permissions, unlimited query quota, and rate-limiter skip bypass
+    const managerProfile = reloaded.getManagerPublicProfile();
+    assert.equal(managerProfile.role, 'Admin');
+    assert.equal(managerProfile.isRootManager, true);
+    assert.equal(managerProfile.permissions.canIdLookup, true);
+    assert.equal(managerProfile.permissions.canBulkLookup, true);
+    assert.equal(managerProfile.permissions.canEmailOsint, true);
+    for (let i = 0; i < 10; i++) {
+      assert.equal(reloaded.consumeQueryQuota('manager_root').allowed, true);
+      assert.equal(reloaded.consumeQueryQuota('admin_root').allowed, true);
+    }
+
+    let skippedCalls = 0;
+    const exemptLimiter = createRateLimiter({
+      windowMs: 60_000,
+      maxRequests: 1,
+      keyPrefix: 'exempt-test',
+      skip: (r) => r.headers['x-priv'] === '1',
+    });
+    for (let i = 0; i < 5; i++) {
+      exemptLimiter(
+        { ip: '198.51.100.123', headers: { 'x-priv': '1' }, socket: { remoteAddress: '198.51.100.123' } } as unknown as Request,
+        { setHeader() {}, status() { return this; }, json() { return this; } } as unknown as Response,
+        () => { skippedCalls += 1; },
+      );
+    }
+    assert.equal(skippedCalls, 5);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Email OSINT normalizes canonical aliases and aggregates local exposed signals into identitySummary', async () => {
+  const sampleRecords = [
+    {
+      id: 'osint_rec_1',
+      datasetId: 'ds_osint_test',
+      datasetName: 'OsintTest',
+      discordId: '104567890123456789',
+      email: 'alice.osint@example.test',
+      username: 'alice_nick',
+      source: 'TestArchive',
+      ip: '198.51.100.22',
+      phone: '+905550001122',
+      notes: '',
+      extra: {
+        password: 'SampleExposedValue99',
+        token: 'tok_sample_1234567890',
+        hwid: 'HWID-TEST-77',
+      },
+    },
+  ];
+
+  const report = await runEmailOsint('Alice.Osint+tag@example.test', sampleRecords, 'tr');
+  assert.equal(report.isValidSyntax, true);
+  assert.ok(report.identitySummary);
+  assert.equal(report.identitySummary.canonicalEmail, 'alice.osint@example.test');
+  assert.equal(report.localMatches.length, 1);
+  assert.ok(report.identitySummary.discoveredUsernames.includes('alice_nick'));
+  assert.ok(report.identitySummary.localExposedSignals.passwords.includes('SampleExposedValue99'));
+  assert.ok(report.identitySummary.localExposedSignals.tokens.includes('tok_sample_1234567890'));
+  assert.ok(report.identitySummary.localExposedSignals.hwids.includes('HWID-TEST-77'));
+  assert.ok(report.identitySummary.localExposedSignals.ips.includes('198.51.100.22'));
+  assert.ok(report.identitySummary.localExposedSignals.discordIds.includes('104567890123456789'));
+});
+
+test('Full vault snapshot exports both memory and ready disk datasets and restores them queryable end-to-end', async () => {
+  const dirSrc = fs.mkdtempSync(path.join(os.tmpdir(), 'sentarika-vault-src-'));
+  const dirDst = fs.mkdtempSync(path.join(os.tmpdir(), 'sentarika-vault-dst-'));
+  try {
+    const src = new ServerStore(dirSrc);
+    src.addBlacklistEntries('999888777666555444');
+    src.updateRoleConfig('Destekçi', { dailyQueryLimit: 555 });
+    await src.registerUserDirectAsync('member.vault@gmail.com', 'vault_user', 'VaultPass!2026', '198.51.100.9', 'uid_v_1');
+
+    // Disk-backed dataset via raw upload
+    const rawDisk = '701810803321471176:vault.disk@example.test:disk_owner:198.51.100.55\n';
+    const buf = Buffer.from(rawDisk, 'utf8');
+    src.initRawUploadDataset({
+      id: 'ds_vault_disk',
+      name: 'VaultDiskDs',
+      format: 'text',
+      sizeBytes: buf.length,
+      columns: ['id', 'email', 'username', 'ip'],
+      mapping: {
+        discordIdField: null,
+        emailField: null,
+        usernameField: null,
+        sourceField: null,
+        ipField: null,
+        phoneField: null,
+        notesField: null,
+      },
+    });
+    src.appendRawUploadChunk('ds_vault_disk', buf, 0);
+    src.startBackgroundIngestion('ds_vault_disk', { delimiter: ':', hasHeader: false, isHeterogeneous: true });
+    for (let i = 0; i < 60; i++) {
+      const cur = src.getDatasetById('ds_vault_disk');
+      if (cur?.ingestionStatus === 'ready') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const snap = src.getCloudSnapshot();
+    assert.equal(snap.datasets.some((d) => d.id === 'ds_vault_disk'), true);
+    assert.equal(snap.records.some((r) => r.datasetId === 'ds_vault_disk' && r.discordId === '701810803321471176'), true);
+    assert.equal(snap.blacklist.discordIds.includes('999888777666555444'), true);
+
+    const dst = new ServerStore(dirDst);
+    const restored = dst.restoreFromCloudSnapshot(snap);
+    assert.equal(restored.restoredUsers, 1);
+    assert.equal(restored.restoredDatasets, 1);
+    assert.equal(restored.restoredRecords, 1);
+    assert.equal(dst.getRoleConfigs().Destekçi.dailyQueryLimit, 555);
+    assert.equal(dst.isDiscordIdBlacklisted('999888777666555444'), true);
+
+    const found = await dst.searchAcrossAllStoresAsync('701810803321471176', 'discord_id', true);
+    assert.equal(found.primaryMatches.length, 1);
+    assert.equal(found.primaryMatches[0].email, 'vault.disk@example.test');
+  } finally {
+    fs.rmSync(dirSrc, { recursive: true, force: true });
+    fs.rmSync(dirDst, { recursive: true, force: true });
+  }
+});
+
+test('Zero-dataset Legal IP OSINT validates IPv4/IPv6, isolates private/reserved ranges, and builds public report cleanly', async () => {
+  assert.equal(isValidIpAddress('not-an-ip').valid, false);
+  assert.equal(isValidIpAddress('999.999.1.1').valid, false);
+
+  const normalizedPort = isValidIpAddress('1.1.1.1:443');
+  assert.equal(normalizedPort.valid, true);
+  assert.equal(normalizedPort.ip, '1.1.1.1');
+  assert.equal(normalizedPort.version, 4);
+
+  const normalizedV6 = isValidIpAddress('[2606:4700:4700::1111]');
+  assert.equal(normalizedV6.valid, true);
+  assert.equal(normalizedV6.ip, '2606:4700:4700::1111');
+  assert.equal(normalizedV6.version, 6);
+
+  const invalidReport = await runIpOsint('invalid-ip', 'tr', { skipNetwork: true });
+  assert.equal(invalidReport.isValid, false);
+
+  const lanReport = await runIpOsint('192.168.1.25', 'tr', { skipNetwork: true });
+  assert.equal(lanReport.isValid, true);
+  assert.equal(lanReport.isPublic, false);
+  assert.match(lanReport.scopeNote, /RFC 1918/);
+  assert.equal(lanReport.pivotLinks.length, 0);
+
+  const cgnatReport = await runIpOsint('100.64.10.2', 'en', { skipNetwork: true });
+  assert.equal(cgnatReport.isValid, true);
+  assert.equal(cgnatReport.isPublic, false);
+  assert.match(cgnatReport.scopeNote, /CGNAT/);
+
+  const loopbackV6 = await runIpOsint('::1', 'tr', { skipNetwork: true });
+  assert.equal(loopbackV6.isValid, true);
+  assert.equal(loopbackV6.version, 6);
+  assert.equal(loopbackV6.isPublic, false);
+
+  const publicReport = await runIpOsint('1.1.1.1', 'tr', { skipNetwork: true });
+  assert.equal(publicReport.isValid, true);
+  assert.equal(publicReport.isPublic, true);
+  assert.equal(publicReport.version, 4);
+  assert.ok(publicReport.pivotLinks.some((l) => l.label === 'RIPEstat'));
+  assert.ok(publicReport.pivotLinks.some((l) => l.label === 'Shodan'));
+});

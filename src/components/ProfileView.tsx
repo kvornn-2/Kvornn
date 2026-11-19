@@ -10,8 +10,18 @@ interface ProfileViewProps {
 
 export function ProfileView({ currentUser, isVerifiedAdmin = false }: ProfileViewProps) {
   const { t } = useI18n();
-  const isAdmin = isVerifiedAdmin && currentUser.id === 'admin_root' && currentUser.role === 'Admin';
-  const displayedRole = isAdmin ? 'Admin' : currentUser.role === 'Admin' ? 'Üye' : currentUser.role;
+  const isAdmin =
+    isVerifiedAdmin &&
+    (currentUser.id === 'admin_root' || currentUser.id === 'manager_root') &&
+    currentUser.role === 'Admin';
+  const isRootManager = Boolean(isAdmin && currentUser.id === 'manager_root' && currentUser.isRootManager);
+  const displayedRole = isRootManager
+    ? t('Yönetici', 'Manager')
+    : isAdmin
+      ? 'Admin'
+      : currentUser.role === 'Admin'
+        ? 'Üye'
+        : currentUser.role;
   const limit = currentUser.permissions.dailyQueryLimit;
   const usagePct = isAdmin ? 0 : limit > 0 ? Math.min(100, Math.round((currentUser.dailyUsed / limit) * 100)) : 100;
 

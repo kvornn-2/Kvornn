@@ -116,6 +116,7 @@ export interface PublicUser {
   username: string;
   displayName: string;
   role: UserRole;
+  isRootManager?: boolean;
   emailVerified: boolean;
   authProvider?: 'google' | 'password';
   banned: boolean;
@@ -131,11 +132,28 @@ export interface AdminUserRow extends PublicUser {
   lastLoginIp: string | null;
 }
 
+export interface AdminTrackedIpRow {
+  ip: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  loginCount: number;
+  queryCount: number;
+  banned: boolean;
+  banReason: string;
+}
+
+export interface AdminOversightData {
+  adminBanned: boolean;
+  adminBanReason: string;
+  adminKeyUpdatedAt: string | null;
+  trackedIps: AdminTrackedIpRow[];
+}
+
 export interface QueryAuditLog {
   id: string;
   userId: string;
   username: string;
-  queryType: 'id_lookup' | 'email_osint' | 'bulk_lookup';
+  queryType: 'id_lookup' | 'email_osint' | 'ip_lookup' | 'bulk_lookup';
   target: string;
   matchCount: number;
   ip: string;
@@ -160,6 +178,27 @@ export interface EmailOsintSourceResult {
   details: Record<string, string | string[]>;
 }
 
+export interface EmailOsintIdentitySummary {
+  canonicalEmail: string;
+  isRoleAddress: boolean;
+  spoofingRisk: 'low' | 'medium' | 'high';
+  bimiRecord: string | null;
+  mtaStsRecord: string | null;
+  microsoftTenant: string | null;
+  discoveredNames: string[];
+  discoveredUsernames: string[];
+  discoveredEmails: string[];
+  discoveredLocations: string[];
+  localExposedSignals: {
+    passwords: string[];
+    tokens: string[];
+    ips: string[];
+    phones: string[];
+    discordIds: string[];
+    hwids: string[];
+  };
+}
+
 export interface EmailOsintReport {
   email: string;
   domain: string;
@@ -174,6 +213,7 @@ export interface EmailOsintReport {
     createdDate: string | null;
     expiryDate: string | null;
   } | null;
+  identitySummary?: EmailOsintIdentitySummary;
   externalChecks: EmailOsintSourceResult[];
   localMatches: IntelRecord[];
   pivotLinks: { label: string; url: string }[];
@@ -181,4 +221,60 @@ export interface EmailOsintReport {
   durationMs: number;
 }
 
-export type ActiveTab = 'lookup' | 'email_osint' | 'bulk' | 'profile' | 'admin' | 'legal' | 'history';
+export interface IpOsintSourceResult {
+  source: string;
+  status: 'found' | 'not_found' | 'error' | 'info';
+  summary: string;
+  details: Record<string, string | string[]>;
+}
+
+export interface IpOsintReport {
+  ip: string;
+  version: 4 | 6;
+  isValid: boolean;
+  isPublic: boolean;
+  scopeNote: string;
+  country: string | null;
+  countryCode: string | null;
+  region: string | null;
+  city: string | null;
+  postal: string | null;
+  timezone: string | null;
+  coordinates: { lat: number; lon: number } | null;
+  isp: string | null;
+  organization: string | null;
+  asn: string | null;
+  asnName: string | null;
+  prefix: string | null;
+  rdap: {
+    handle: string | null;
+    name: string | null;
+    cidr: string | null;
+    rir: string | null;
+    country: string | null;
+    type: string | null;
+    status: string[];
+    abuseContacts: string[];
+    registeredDate: string | null;
+    lastChangedDate: string | null;
+  } | null;
+  ptrHostnames: string[];
+  fcrdnsVerified: boolean;
+  flags: {
+    hosting: boolean;
+    proxy: boolean;
+    mobile: boolean;
+    torExit: boolean;
+  };
+  openPorts: number[];
+  vulns: string[];
+  cpes: string[];
+  tags: string[];
+  hostnames: string[];
+  externalChecks: IpOsintSourceResult[];
+  pivotLinks: { label: string; url: string }[];
+  checkedAt: string;
+  durationMs: number;
+}
+
+export type ActiveTab = 'lookup' | 'email_osint' | 'ip_osint' | 'bulk' | 'profile' | 'admin' | 'legal' | 'history';

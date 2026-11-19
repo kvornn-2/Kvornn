@@ -1,4 +1,4 @@
-import { Search, MailSearch, Layers, ShieldCheck, Scale, History, User, LogOut, X } from 'lucide-react';
+import { Search, MailSearch, Globe, Layers, ShieldCheck, Scale, History, User, LogOut, X } from 'lucide-react';
 import type { ActiveTab, PublicUser } from '../types/intel';
 import { useI18n } from '../i18n/I18nContext';
 
@@ -26,10 +26,15 @@ export function Sidebar({
   onLogout,
 }: SidebarProps) {
   const { lang, t } = useI18n();
-  const isAdmin = isVerifiedAdmin && currentUser.id === 'admin_root' && currentUser.role === 'Admin';
+  const isAdmin =
+    isVerifiedAdmin &&
+    (currentUser.id === 'admin_root' || currentUser.id === 'manager_root') &&
+    currentUser.role === 'Admin';
+  const isRootManager = Boolean(isAdmin && currentUser.id === 'manager_root' && currentUser.isRootManager);
   const navItems: { id: ActiveTab; label: string; icon: typeof Search; visible: boolean }[] = [
     { id: 'lookup', label: t('ID Sorgu', 'ID Lookup'), icon: Search, visible: true },
     { id: 'email_osint', label: t('E-posta OSINT', 'Email OSINT'), icon: MailSearch, visible: true },
+    { id: 'ip_osint', label: t('IP Sorgu', 'IP Lookup'), icon: Globe, visible: true },
     { id: 'bulk', label: t('Toplu Sorgu', 'Bulk Lookup'), icon: Layers, visible: currentUser.permissions.canBulkLookup || isAdmin },
     { id: 'profile', label: t('Profilim', 'My Profile'), icon: User, visible: true },
     { id: 'admin', label: t('Admin Paneli', 'Admin Panel'), icon: ShieldCheck, visible: isAdmin },
@@ -107,7 +112,9 @@ export function Sidebar({
               >
                 {currentUser.username}
               </button>
-              <span className="font-medium text-blue-600 dark:text-blue-400 shrink-0">{currentUser.role}</span>
+              <span className="font-medium text-blue-600 dark:text-blue-400 shrink-0">
+                {isRootManager ? t('Yönetici', 'Manager') : currentUser.role}
+              </span>
             </div>
             <div className="flex items-center justify-between text-slate-500 dark:text-slate-400">
               <span>{t('Günlük Kota', 'Daily Quota')}</span>

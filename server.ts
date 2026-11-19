@@ -17,6 +17,7 @@ import {
   signSessionToken,
   verifyAdminKey,
   verifyAdminSessionClaim,
+  verifyManagerSessionClaim,
   verifySessionToken,
   type SessionPayload,
 } from './server/security.ts';
@@ -29,7 +30,8 @@ import {
   touchUserUsageInFirestoreWithToken,
 } from './server/firestoreBridge.ts';
 import { ServerStore } from './server/store.ts';
-import { runEmailOsint } from './server/emailOsint.ts';
+import { mergeLocalSignalsIntoIdentitySummary, runEmailOsint } from './server/emailOsint.ts';
+import { isValidIpAddress, runIpOsint } from './server/ipOsint.ts';
 import { decodeSnowflake, isValidSnowflake } from './src/utils/snowflake.ts';
 import { classifyRecordDatabaseType, filterDatabaseRecords, sanitizeRecordsForQueryResponse } from './src/utils/search.ts';
 import {
@@ -102,12 +104,32 @@ function getRateLimitSubject(req: Request): string {
   return `ip:${getClientIp(req)}`;
 }
 
+function isVerifiedPrivilegedRequest(req: Request): boolean {
+  const authedReq = req as AuthedRequest;
+  if (authedReq.currentUser?.id === 'manager_root' || authedReq.currentUser?.id === 'admin_root') {
+    return true;
+  }
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return false;
+  const payload = verifySessionToken(header.slice(7).trim(), store.getSessionSecret());
+  if (!payload) return false;
+  if (payload.userId === 'manager_root') {
+    return verifyManagerSessionClaim(payload, store.getManagerTokenEpoch());
+  }
+  if (payload.userId === 'admin_root') {
+    if (!verifyAdminSessionClaim(payload, store.getAdminTokenEpoch())) return false;
+    return !store.isAdminBlockedForIp(getClientIp(req)).blocked;
+  }
+  return false;
+}
+
 const globalApiLimiter = createRateLimiter({
   windowMs: 60 * 1000,
   maxRequests: 400,
   keyPrefix: 'api-global',
   violationWeight: 0,
   keyGenerator: getRateLimitSubject,
+  skip: isVerifiedPrivilegedRequest,
   message: 'Hız sınırı aşıldı (DDoS / Flood koruması). Lütfen 1 dakika içinde tekrar deneyin.',
 });
 
@@ -133,6 +155,7 @@ const searchLimiter = createRateLimiter({
   keyPrefix: 'query-search',
   violationWeight: 0,
   keyGenerator: getRateLimitSubject,
+  skip: isVerifiedPrivilegedRequest,
   message: 'Sorgu hız sınırı aşıldı. Lütfen kısa süre bekleyip tekrar deneyin.',
 });
 
@@ -142,6 +165,7 @@ const osintLimiter = createRateLimiter({
   keyPrefix: 'query-osint',
   violationWeight: 0,
   keyGenerator: getRateLimitSubject,
+  skip: isVerifiedPrivilegedRequest,
   message: 'OSINT tarama hız sınırı aşıldı. Lütfen 1 dakika içinde tekrar deneyin.',
 });
 
@@ -157,10 +181,22 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
     res.status(401).json({ error: 'Oturum geçersiz veya süresi dolmuş. Lütfen yeniden giriş yapın.' });
     return;
   }
-  if (payload.userId === 'admin_root') {
+  const clientIp = getClientIp(req);
+  if (payload.userId === 'manager_root') {
+    if (!verifyManagerSessionClaim(payload, store.getManagerTokenEpoch())) {
+      recordIpViolation(clientIp, 3);
+      res.status(401).json({ error: 'Baş yönetici oturum yetkisi doğrulanamadı.' });
+      return;
+    }
+  } else if (payload.userId === 'admin_root') {
     if (!verifyAdminSessionClaim(payload, store.getAdminTokenEpoch())) {
-      recordIpViolation(getClientIp(req), 3);
+      recordIpViolation(clientIp, 3);
       res.status(401).json({ error: 'Yönetici oturum yetkisi doğrulanamadı.' });
+      return;
+    }
+    const adminBan = store.isAdminBlockedForIp(clientIp);
+    if (adminBan.blocked) {
+      res.status(403).json({ error: adminBan.reason });
       return;
     }
   } else if (payload.epoch !== store.getUserTokenEpoch()) {
@@ -176,7 +212,7 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
     res.status(403).json({ error: 'Hesap doğrulaması tamamlanmamış.' });
     return;
   }
-  if (user.banned) {
+  if (user.banned && user.id !== 'manager_root') {
     res.status(403).json({ error: `Hesabınız yasaklandı: ${user.banReason || 'Yönetici kararı'}` });
     return;
   }
@@ -187,13 +223,32 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
 
 function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
   requireAuth(req, res, () => {
-    if (
-      req.currentUser?.id !== 'admin_root' ||
-      req.currentUser?.role !== 'Admin' ||
-      !verifyAdminSessionClaim(req.sessionPayload || null, store.getAdminTokenEpoch())
-    ) {
+    const isManager =
+      req.currentUser?.id === 'manager_root' &&
+      req.currentUser?.role === 'Admin' &&
+      verifyManagerSessionClaim(req.sessionPayload || null, store.getManagerTokenEpoch());
+    const isAdmin =
+      req.currentUser?.id === 'admin_root' &&
+      req.currentUser?.role === 'Admin' &&
+      verifyAdminSessionClaim(req.sessionPayload || null, store.getAdminTokenEpoch());
+    if (!isManager && !isAdmin) {
       recordIpViolation(getClientIp(req), 2);
       res.status(403).json({ error: 'Bu işlem yalnızca Admin hesabı tarafından yapılabilir.' });
+      return;
+    }
+    next();
+  });
+}
+
+function requireManager(req: AuthedRequest, res: Response, next: NextFunction) {
+  requireAuth(req, res, () => {
+    if (
+      req.currentUser?.id !== 'manager_root' ||
+      req.currentUser?.role !== 'Admin' ||
+      !verifyManagerSessionClaim(req.sessionPayload || null, store.getManagerTokenEpoch())
+    ) {
+      recordIpViolation(getClientIp(req), 3);
+      res.status(403).json({ error: 'Bu işlem yalnızca Baş Yönetici anahtarıyla yapılabilir.' });
       return;
     }
     next();
@@ -303,7 +358,7 @@ app.use('/api', ipShieldMiddleware, globalApiLimiter);
 // Enforce Admin authentication BEFORE accepting large dataset/snapshot JSON bodies (within Cloud Run 32MB ceiling)
 app.use('/api/datasets', requireAdmin, express.json({ limit: '24mb' }), sanitizeRequestBodyMiddleware);
 app.use('/api/admin/datasets', requireAdmin, express.json({ limit: '24mb' }), sanitizeRequestBodyMiddleware);
-app.use('/api/admin/firestore/import-snapshot', requireAdmin, express.json({ limit: '24mb' }), sanitizeRequestBodyMiddleware);
+app.use('/api/admin/firestore/import-snapshot', requireManager, express.json({ limit: '24mb' }), sanitizeRequestBodyMiddleware);
 app.use(express.json({ limit: '256kb' }));
 app.use(sanitizeRequestBodyMiddleware);
 
@@ -509,13 +564,39 @@ app.post('/api/auth/login', authLimiter, async (req, res, next) => {
 
 app.post('/api/auth/admin-login', adminKeyLimiter, (req, res) => {
   const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
-  if (!verifyAdminKey(key, store.getAdminKeyHash())) {
-    recordIpViolation(getClientIp(req), 2);
-    res.status(401).json({ error: '30 haneli yönetici anahtarı geçersiz.' });
+  const clientIp = getClientIp(req);
+
+  if (verifyAdminKey(key, store.getManagerKeyHash())) {
+    resetRateLimitKey('admin-key', clientIp);
+    const user = store.getManagerPublicProfile();
+    const token = signSessionToken(
+      {
+        userId: user.id,
+        role: user.role,
+        managerGrant: true,
+        managerEpoch: store.getManagerTokenEpoch(),
+        exp: Date.now() + 24 * 60 * 60 * 1000,
+      },
+      store.getSessionSecret(),
+    );
+    res.json({ token, user });
     return;
   }
 
-  resetRateLimitKey('admin-key', getClientIp(req));
+  if (!verifyAdminKey(key, store.getAdminKeyHash())) {
+    recordIpViolation(clientIp, 2);
+    res.status(401).json({ error: '30 haneli anahtar geçersiz.' });
+    return;
+  }
+
+  const adminBan = store.isAdminBlockedForIp(clientIp);
+  if (adminBan.blocked) {
+    res.status(403).json({ error: adminBan.reason });
+    return;
+  }
+
+  resetRateLimitKey('admin-key', clientIp);
+  store.recordAdminIpActivity(clientIp, 'login');
   const user = store.getAdminPublicProfile();
   const token = signSessionToken(
     {
@@ -536,7 +617,7 @@ app.post('/api/auth/admin-google-login', adminKeyLimiter, (_req, res) => {
   });
 });
 
-app.post('/api/admin/cloud-authorize', requireAdmin, async (req, res) => {
+app.post('/api/admin/cloud-authorize', requireManager, async (req, res) => {
   const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken : '';
   if (!idToken) {
     res.status(400).json({ error: 'Kimlik doğrulama belirteci zorunludur.' });
@@ -601,14 +682,18 @@ app.post('/api/search', requireAuth, searchLimiter, async (req: AuthedRequest, r
     const filteredPrimary = rawResult.primaryMatches.filter((r) => !store.isRecordBlacklisted(r));
     const filteredRelated = rawResult.relatedMatches.filter((r) => !store.isRecordBlacklisted(r));
 
-    store.appendQueryAuditLog({
-      userId: user.id,
-      username: user.username,
-      queryType: 'id_lookup',
-      target: query,
-      matchCount: filteredPrimary.length + filteredRelated.length,
-      ip: getClientIp(req),
-    });
+    if (user.id === 'admin_root') {
+      store.recordAdminIpActivity(getClientIp(req), 'query');
+    } else if (!isAdmin) {
+      store.appendQueryAuditLog({
+        userId: user.id,
+        username: user.username,
+        queryType: 'id_lookup',
+        target: query,
+        matchCount: filteredPrimary.length + filteredRelated.length,
+        ip: getClientIp(req),
+      });
+    }
 
     res.json({
       result: {
@@ -691,14 +776,18 @@ app.post('/api/bulk-search', requireAuth, osintLimiter, async (req: AuthedReques
       };
     });
 
-    store.appendQueryAuditLog({
-      userId: user.id,
-      username: user.username,
-      queryType: 'bulk_lookup',
-      target: `${rows.length} Discord ID`,
-      matchCount: rows.filter((r) => r.matches.length > 0).length,
-      ip: getClientIp(req),
-    });
+    if (user.id === 'admin_root') {
+      store.recordAdminIpActivity(getClientIp(req), 'query');
+    } else if (!isAdmin) {
+      store.appendQueryAuditLog({
+        userId: user.id,
+        username: user.username,
+        queryType: 'bulk_lookup',
+        target: `${rows.length} Discord ID`,
+        matchCount: rows.filter((r) => r.matches.length > 0).length,
+        ip: getClientIp(req),
+      });
+    }
 
     res.json({
       rows,
@@ -745,6 +834,12 @@ app.post('/api/osint/email', requireAuth, osintLimiter, async (req: AuthedReques
       hasDiskDatasets ? store.searchAcrossAllStoresAsync(email, 'email', true) : Promise.resolve(null),
     ]);
 
+    const canonicalTarget = report.identitySummary?.canonicalEmail || '';
+    let crossCanonRes = null;
+    if (hasDiskDatasets && canonicalTarget && canonicalTarget !== email.trim().toLowerCase()) {
+      crossCanonRes = await store.searchAcrossAllStoresAsync(canonicalTarget, 'email', true);
+    }
+
     const combinedMap = new Map<string, IntelRecord>();
     for (const m of report.localMatches) combinedMap.set(m.id, m);
     if (crossEmailRes) {
@@ -752,25 +847,93 @@ app.post('/api/osint/email', requireAuth, osintLimiter, async (req: AuthedReques
         combinedMap.set(m.id, m);
       }
     }
+    if (crossCanonRes) {
+      for (const m of [...crossCanonRes.primaryMatches, ...crossCanonRes.relatedMatches]) {
+        combinedMap.set(m.id, m);
+      }
+    }
 
     const isAdmin = user.role === 'Admin';
     const safeLocalMatches = Array.from(combinedMap.values()).filter((m) => !store.isRecordBlacklisted(m));
+    const finalMatches = sanitizeRecordsForRole(safeLocalMatches, isAdmin);
+    const enrichedSummary = report.identitySummary
+      ? mergeLocalSignalsIntoIdentitySummary(report.identitySummary, finalMatches)
+      : undefined;
 
-    store.appendQueryAuditLog({
-      userId: user.id,
-      username: user.username,
-      queryType: 'email_osint',
-      target: email,
-      matchCount: safeLocalMatches.length,
-      ip: getClientIp(req),
-    });
+    if (user.id === 'admin_root') {
+      store.recordAdminIpActivity(getClientIp(req), 'query');
+    } else if (!isAdmin) {
+      store.appendQueryAuditLog({
+        userId: user.id,
+        username: user.username,
+        queryType: 'email_osint',
+        target: email,
+        matchCount: safeLocalMatches.length,
+        ip: getClientIp(req),
+      });
+    }
 
     res.json({
       report: {
         ...report,
-        localMatches: sanitizeRecordsForRole(safeLocalMatches, isAdmin),
+        ...(enrichedSummary ? { identitySummary: enrichedSummary } : {}),
+        localMatches: finalMatches,
       },
       maskedByPolicy: false,
+      user: store.getUserById(user.id),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- Zero-Dataset Legal IP Lookup & Infrastructure OSINT ---
+app.post('/api/osint/ip', requireAuth, osintLimiter, async (req: AuthedRequest, res, next) => {
+  try {
+    const user = req.currentUser!;
+    const rawIp = sanitizeString(req.body?.ip, 80);
+    const lang = req.body?.lang === 'en' ? 'en' : 'tr';
+
+    const parsed = isValidIpAddress(rawIp);
+    if (!parsed.valid) {
+      res.status(400).json({
+        error:
+          lang === 'en'
+            ? 'Please enter a valid IPv4 or IPv6 address (e.g., 1.1.1.1 or 2606:4700:4700::1111).'
+            : 'Lütfen geçerli bir IPv4 veya IPv6 adresi girin (ör. 1.1.1.1 veya 2606:4700:4700::1111).',
+      });
+      return;
+    }
+
+    const quota = store.consumeQueryQuota(user.id);
+    if (!quota.allowed) {
+      res.status(429).json({
+        error:
+          lang === 'en'
+            ? `Your daily query quota (${quota.limit}) has been reached.`
+            : `Günlük sorgu hakkınız (${quota.limit}) dolmuştur.`,
+      });
+      return;
+    }
+
+    const report = await runIpOsint(parsed.ip, lang);
+    const isAdmin = user.role === 'Admin';
+
+    if (user.id === 'admin_root') {
+      store.recordAdminIpActivity(getClientIp(req), 'query');
+    } else if (!isAdmin) {
+      store.appendQueryAuditLog({
+        userId: user.id,
+        username: user.username,
+        queryType: 'ip_lookup',
+        target: report.ip,
+        matchCount: report.isPublic ? 1 : 0,
+        ip: getClientIp(req),
+      });
+    }
+
+    res.json({
+      report,
       user: store.getUserById(user.id),
     });
   } catch (err) {
@@ -879,7 +1042,8 @@ app.get('/api/admin/verify', requireAdmin, (req, res) => {
   res.json({ verified: true, role: 'Admin', nonce });
 });
 
-app.get('/api/admin/overview', requireAdmin, (_req, res) => {
+app.get('/api/admin/overview', requireAdmin, (req: AuthedRequest, res) => {
+  const isRootManager = Boolean(req.currentUser?.isRootManager && req.currentUser?.id === 'manager_root');
   res.json({
     users: store.listAllUsersForAdmin(),
     roles: store.getRoleConfigs(),
@@ -889,7 +1053,43 @@ app.get('/api/admin/overview', requireAdmin, (_req, res) => {
     blacklist: store.getBlacklist(),
     recordsSample: store.getSampleRecordsForAdmin(150),
     stats: store.getStats(),
+    isRootManager,
+    ...(isRootManager ? { adminOversight: store.getAdminOversightForManager() } : {}),
   });
+});
+
+// --- Root Manager ("Yönetici Key") Only Routes: Admin IP Oversight, Admin Ban, & Admin Key Reset ---
+app.post('/api/manager/admin-ban', requireManager, (req, res) => {
+  const banned = req.body?.banned === true;
+  const reason = sanitizeString(req.body?.reason, 240);
+  const adminOversight = store.setAdminGlobalBan(banned, reason);
+  res.json({ ok: true, adminOversight });
+});
+
+app.post('/api/manager/admin-ip-ban', requireManager, (req, res) => {
+  const ip = sanitizeString(req.body?.ip, 80);
+  const banned = req.body?.banned === true;
+  const reason = sanitizeString(req.body?.reason, 240);
+  try {
+    const adminOversight = store.setAdminIpBan(ip, banned, reason);
+    res.json({ ok: true, adminOversight });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Admin IP güncellenemedi.' });
+  }
+});
+
+app.post('/api/manager/admin-key/reset', requireManager, (req, res) => {
+  const customKey = typeof req.body?.customKey === 'string' ? req.body.customKey.trim() : '';
+  try {
+    const result = store.resetOrUploadAdminKey(customKey || undefined);
+    res.json({
+      ok: true,
+      newAdminKey: result.adminKey,
+      adminOversight: result.oversight,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Admin anahtarı güncellenemedi.' });
+  }
 });
 
 app.get('/api/admin/blacklist', requireAdmin, (_req, res) => {
@@ -1159,11 +1359,11 @@ app.post('/api/admin/users/kick-all', requireAdmin, (req, res) => {
   res.json({ ok: true, kickedCount: result.kickedCount, clearAccounts });
 });
 
-app.get('/api/admin/firestore/export-snapshot', requireAdmin, (_req, res) => {
+app.get('/api/admin/firestore/export-snapshot', requireManager, (_req, res) => {
   res.json(store.getCloudSnapshot());
 });
 
-app.post('/api/admin/firestore/import-snapshot', requireAdmin, (req, res) => {
+app.post('/api/admin/firestore/import-snapshot', requireManager, (req, res) => {
   const body = req.body || {};
   const result = store.restoreFromCloudSnapshot({
     users: Array.isArray(body.users) ? body.users : undefined,

@@ -465,14 +465,14 @@ export function AuthGate({ onAuthenticated, isDark, onToggleTheme }: AuthGatePro
             <form onSubmit={handleAdminSubmit} className="mt-4 space-y-4">
               <p className="text-xs leading-relaxed text-slate-600 dark:text-slate-400">
                 {t(
-                  'Veri deposu yükleme, veritabanını inceleme, kullanıcı doğrulama/yasaklama ve rol haklarını yönetme yetkisi yalnızca 30 haneli anahtara sahip Admin hesabındadır.',
-                  'Uploading datasets, inspecting the database, verifying/banning users, and managing role permissions are strictly restricted to the 30-digit Admin key.',
+                  'Veri deposu yükleme, veritabanını inceleme, kullanıcı doğrulama/yasaklama ve rol haklarını yönetme yetkisi 30 haneli Admin veya Yönetici anahtarıyla açılır.',
+                  'Uploading datasets, inspecting the database, verifying/banning users, and managing role permissions require the 30-digit Admin or Manager key.',
                 )}
               </p>
 
               <div>
                 <label htmlFor="admin-key-input" className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                  {t('30 Haneli Yönetici Anahtarı', '30-Digit Admin Key')}
+                  {t('30 Haneli Admin / Yönetici Anahtarı', '30-Digit Admin / Manager Key')}
                 </label>
                 <input
                   id="admin-key-input"

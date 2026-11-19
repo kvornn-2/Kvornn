@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type {
+  AdminOversightData,
+  AdminTrackedIpRow,
   AdminUserRow,
   BlockedRegistrationAttempt,
   BulkQueryRow,
@@ -46,6 +48,7 @@ import {
   iterateShardRecordsSync,
 } from './diskIndex.ts';
 import {
+  generateThirtyDigitKey,
   hashAdminKey,
   hashPassword,
   hashPasswordAsync,
@@ -76,8 +79,13 @@ export interface StoredUser {
 interface SecuritySecrets {
   sessionSecret: string;
   adminKeyHash: string;
+  managerKeyHash?: string;
   userTokenEpoch?: string;
   adminTokenEpoch?: string;
+  managerTokenEpoch?: string;
+  adminBanned?: boolean;
+  adminBanReason?: string;
+  adminKeyUpdatedAt?: string | null;
 }
 
 const DEFAULT_DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data'));
@@ -86,6 +94,10 @@ const DEFAULT_DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(process.
 export const PERMANENT_ADMIN_KEY_HASH =
   '412c21e2dac39e0e1058121fee5beeea64fd92eaf0c5d7d224dc0a10ed775d4c';
 
+// Permanent 30-digit Root Manager ("Yönetici") Key SHA-256 hash (plaintext key is NEVER embedded in source code)
+export const PERMANENT_MANAGER_KEY_HASH =
+  'a25865902438921564e2a22077eb1a2ceaf0e958ace95a8b2adb8373243c695a';
+
 // Deterministic server-side session HMAC fallback so signed sessions survive Cloud Run cold starts
 const STABLE_SESSION_FALLBACK = crypto
   .createHmac('sha256', 'sentarika-archive-session-key-v1')
@@ -93,6 +105,7 @@ const STABLE_SESSION_FALLBACK = crypto
   .digest('hex');
 
 const DEFAULT_ADMIN_TOKEN_EPOCH = 'adm_v1';
+const DEFAULT_MANAGER_TOKEN_EPOCH = 'mgr_v1';
 
 export const ADMIN_PERMISSIONS: RolePermissions = {
   dailyQueryLimit: 999999,
@@ -245,6 +258,7 @@ export class ServerStore {
   private readonly secretsFile: string;
   private readonly adminKeyFile: string;
   private readonly blacklistFile: string;
+  private readonly adminIpsFile: string;
 
   private users: StoredUser[] = [];
   private roles: RoleConfigMap = structuredClone(DEFAULT_ROLES);
@@ -252,6 +266,7 @@ export class ServerStore {
   private records: IntelRecord[] = [];
   private queryLogs: QueryAuditLog[] = [];
   private blockedAttempts: BlockedRegistrationAttempt[] = [];
+  private adminTrackedIps: AdminTrackedIpRow[] = [];
   private blacklistedDiscordIds = new Set<string>();
   private blacklistedEmails = new Set<string>();
   private deletedDatasetIds = new Set<string>();
@@ -265,6 +280,8 @@ export class ServerStore {
   private secrets!: SecuritySecrets;
   private adminDailyUsed = 0;
   private adminUsageDate = todayKey();
+  private managerDailyUsed = 0;
+  private managerUsageDate = todayKey();
 
   constructor(customDataDir?: string) {
     this.dataDir = customDataDir ? path.resolve(customDataDir) : DEFAULT_DATA_DIR;
@@ -277,6 +294,7 @@ export class ServerStore {
     this.secretsFile = path.join(this.dataDir, 'secrets.json');
     this.adminKeyFile = path.join(this.dataDir, 'admin.key');
     this.blacklistFile = path.join(this.dataDir, 'blacklist.json');
+    this.adminIpsFile = path.join(this.dataDir, 'admin_ips.json');
 
     ensureDir(this.dataDir);
     this.diskIndex = new DiskIndex(this.dataDir);
@@ -288,8 +306,20 @@ export class ServerStore {
       category: d.category || 'both',
     }));
     this.loadAllRecords();
-    this.queryLogs = readJsonFile<QueryAuditLog[]>(this.logsFile, []);
+    const rawLogs = readJsonFile<QueryAuditLog[]>(this.logsFile, []);
+    this.queryLogs = rawLogs.filter(
+      (l) =>
+        l &&
+        l.userId !== 'admin_root' &&
+        l.userId !== 'manager_root' &&
+        l.username !== 'Sistem Yöneticisi' &&
+        l.username !== 'Yönetici',
+    );
+    if (this.queryLogs.length !== rawLogs.length) {
+      writeJsonFile(this.logsFile, this.queryLogs);
+    }
     this.blockedAttempts = readJsonFile<BlockedRegistrationAttempt[]>(this.blockedAttemptsFile, []);
+    this.adminTrackedIps = readJsonFile<AdminTrackedIpRow[]>(this.adminIpsFile, []);
     const savedBlacklist = readJsonFile<Partial<QueryBlacklist>>(this.blacklistFile, {});
     if (Array.isArray(savedBlacklist.discordIds)) {
       for (const id of savedBlacklist.discordIds) {
@@ -389,36 +419,58 @@ export class ServerStore {
 
   private initSecrets() {
     const envAdminKey = process.env.ADMIN_ACCESS_KEY?.trim();
+    const envManagerKey = process.env.MANAGER_ACCESS_KEY?.trim();
     const envSessionSecret = process.env.SESSION_SECRET?.trim();
-    const resolvedAdminHash =
-      envAdminKey && /^\d{30}$/.test(envAdminKey) ? hashAdminKey(envAdminKey) : PERMANENT_ADMIN_KEY_HASH;
 
     const existing = fs.existsSync(this.secretsFile)
       ? readJsonFile<SecuritySecrets | null>(this.secretsFile, null)
       : null;
 
+    const resolvedAdminHash =
+      existing?.adminKeyHash && /^[0-9a-f]{64}$/i.test(existing.adminKeyHash)
+        ? existing.adminKeyHash
+        : envAdminKey && /^\d{30}$/.test(envAdminKey)
+          ? hashAdminKey(envAdminKey)
+          : PERMANENT_ADMIN_KEY_HASH;
+
+    const resolvedManagerHash =
+      envManagerKey && /^\d{30}$/.test(envManagerKey)
+        ? hashAdminKey(envManagerKey)
+        : existing?.managerKeyHash && /^[0-9a-f]{64}$/i.test(existing.managerKeyHash)
+          ? existing.managerKeyHash
+          : PERMANENT_MANAGER_KEY_HASH;
+
     const resolvedSessionSecret = envSessionSecret || STABLE_SESSION_FALLBACK;
     const userTokenEpoch = existing?.userTokenEpoch || 'usr_v1';
     const adminTokenEpoch = existing?.adminTokenEpoch || DEFAULT_ADMIN_TOKEN_EPOCH;
+    const managerTokenEpoch = existing?.managerTokenEpoch || DEFAULT_MANAGER_TOKEN_EPOCH;
 
     this.secrets = {
       sessionSecret: resolvedSessionSecret,
       adminKeyHash: resolvedAdminHash,
+      managerKeyHash: resolvedManagerHash,
       userTokenEpoch,
       adminTokenEpoch,
+      managerTokenEpoch,
+      adminBanned: Boolean(existing?.adminBanned),
+      adminBanReason: typeof existing?.adminBanReason === 'string' ? existing.adminBanReason : '',
+      adminKeyUpdatedAt: existing?.adminKeyUpdatedAt || null,
     };
 
     if (
       !existing ||
       existing.sessionSecret !== this.secrets.sessionSecret ||
       existing.adminKeyHash !== this.secrets.adminKeyHash ||
+      existing.managerKeyHash !== this.secrets.managerKeyHash ||
       existing.userTokenEpoch !== this.secrets.userTokenEpoch ||
-      existing.adminTokenEpoch !== this.secrets.adminTokenEpoch
+      existing.adminTokenEpoch !== this.secrets.adminTokenEpoch ||
+      existing.managerTokenEpoch !== this.secrets.managerTokenEpoch ||
+      Boolean(existing.adminBanned) !== Boolean(this.secrets.adminBanned)
     ) {
       writeJsonFile(this.secretsFile, this.secrets);
     }
 
-    if (envAdminKey && /^\d{30}$/.test(envAdminKey)) {
+    if (envAdminKey && /^\d{30}$/.test(envAdminKey) && !existing?.adminKeyUpdatedAt) {
       fs.writeFileSync(this.adminKeyFile, `${envAdminKey}\n`, { encoding: 'utf8', mode: 0o600 });
     }
   }
@@ -431,12 +483,139 @@ export class ServerStore {
     return this.secrets.adminKeyHash;
   }
 
+  getManagerKeyHash(): string {
+    return this.secrets.managerKeyHash || PERMANENT_MANAGER_KEY_HASH;
+  }
+
   getUserTokenEpoch(): string {
     return this.secrets.userTokenEpoch || 'usr_v1';
   }
 
   getAdminTokenEpoch(): string {
     return this.secrets.adminTokenEpoch || DEFAULT_ADMIN_TOKEN_EPOCH;
+  }
+
+  getManagerTokenEpoch(): string {
+    return this.secrets.managerTokenEpoch || DEFAULT_MANAGER_TOKEN_EPOCH;
+  }
+
+  isAdminBlockedForIp(ip: string): { blocked: boolean; reason: string } {
+    if (this.secrets.adminBanned) {
+      return {
+        blocked: true,
+        reason: this.secrets.adminBanReason || 'Admin erişimi Yönetici tarafından geçici olarak yasaklandı.',
+      };
+    }
+    const cleanIp = ip.trim();
+    if (cleanIp) {
+      const ipEntry = this.adminTrackedIps.find((row) => row.ip === cleanIp);
+      if (ipEntry?.banned) {
+        return {
+          blocked: true,
+          reason: ipEntry.banReason || 'Bu Admin IP adresi Yönetici tarafından engellendi.',
+        };
+      }
+    }
+    return { blocked: false, reason: '' };
+  }
+
+  recordAdminIpActivity(ip: string, kind: 'login' | 'query') {
+    const cleanIp = ip.trim();
+    if (!cleanIp || cleanIp === 'unknown') return;
+    const now = new Date().toISOString();
+    const existing = this.adminTrackedIps.find((r) => r.ip === cleanIp);
+    if (existing) {
+      existing.lastSeenAt = now;
+      if (kind === 'login') existing.loginCount += 1;
+      else existing.queryCount += 1;
+    } else {
+      this.adminTrackedIps.unshift({
+        ip: cleanIp,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        loginCount: kind === 'login' ? 1 : 0,
+        queryCount: kind === 'query' ? 1 : 0,
+        banned: false,
+        banReason: '',
+      });
+      this.adminTrackedIps = this.adminTrackedIps.slice(0, 150);
+    }
+    this.scheduleJsonWrite(this.adminIpsFile, () => JSON.stringify(this.adminTrackedIps, null, 2));
+  }
+
+  getAdminOversightForManager(): AdminOversightData {
+    return {
+      adminBanned: Boolean(this.secrets.adminBanned),
+      adminBanReason: this.secrets.adminBanReason || '',
+      adminKeyUpdatedAt: this.secrets.adminKeyUpdatedAt || null,
+      trackedIps: [...this.adminTrackedIps].sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)),
+    };
+  }
+
+  setAdminGlobalBan(banned: boolean, reason = ''): AdminOversightData {
+    this.secrets.adminBanned = banned;
+    this.secrets.adminBanReason = banned ? reason.trim() || 'Admin erişimi Yönetici tarafından yasaklandı.' : '';
+    if (banned) {
+      this.secrets.adminTokenEpoch = `adm_${crypto.randomBytes(6).toString('hex')}`;
+    }
+    this.writeJsonSyncAndCancelPending(this.secretsFile, this.secrets);
+    return this.getAdminOversightForManager();
+  }
+
+  setAdminIpBan(ip: string, banned: boolean, reason = ''): AdminOversightData {
+    const cleanIp = ip.trim();
+    if (!cleanIp) throw new Error('Geçersiz IP adresi.');
+    const now = new Date().toISOString();
+    let row = this.adminTrackedIps.find((r) => r.ip === cleanIp);
+    if (!row) {
+      row = {
+        ip: cleanIp,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        loginCount: 0,
+        queryCount: 0,
+        banned,
+        banReason: '',
+      };
+      this.adminTrackedIps.unshift(row);
+    }
+    row.banned = banned;
+    row.banReason = banned ? reason.trim() || 'Admin IP Yönetici tarafından engellendi.' : '';
+    if (banned) {
+      this.secrets.adminTokenEpoch = `adm_${crypto.randomBytes(6).toString('hex')}`;
+      this.writeJsonSyncAndCancelPending(this.secretsFile, this.secrets);
+    }
+    this.writeJsonSyncAndCancelPending(this.adminIpsFile, this.adminTrackedIps);
+    return this.getAdminOversightForManager();
+  }
+
+  resetOrUploadAdminKey(customKey?: string): { adminKey: string; oversight: AdminOversightData } {
+    let nextKey: string;
+    if (customKey && customKey.trim()) {
+      const cleaned = customKey.trim();
+      if (!/^\d{30}$/.test(cleaned)) {
+        throw new Error('Yeni Admin anahtarı tam olarak 30 haneli rakamdan oluşmalıdır.');
+      }
+      if (hashAdminKey(cleaned) === this.getManagerKeyHash()) {
+        throw new Error('Admin anahtarı Yönetici anahtarıyla aynı olamaz.');
+      }
+      nextKey = cleaned;
+    } else {
+      do {
+        nextKey = generateThirtyDigitKey();
+      } while (hashAdminKey(nextKey) === this.getManagerKeyHash());
+    }
+
+    this.secrets.adminKeyHash = hashAdminKey(nextKey);
+    this.secrets.adminTokenEpoch = `adm_${crypto.randomBytes(6).toString('hex')}`;
+    this.secrets.adminKeyUpdatedAt = new Date().toISOString();
+    this.writeJsonSyncAndCancelPending(this.secretsFile, this.secrets);
+    fs.writeFileSync(this.adminKeyFile, `${nextKey}\n`, { encoding: 'utf8', mode: 0o600 });
+
+    return {
+      adminKey: nextKey,
+      oversight: this.getAdminOversightForManager(),
+    };
   }
 
   private writeJsonSyncAndCancelPending(filePath: string, data: unknown) {
@@ -575,10 +754,35 @@ export class ServerStore {
       username: 'Sistem Yöneticisi',
       displayName: 'Sistem Yöneticisi',
       role: 'Admin',
+      isRootManager: false,
+      emailVerified: true,
+      banned: Boolean(this.secrets.adminBanned),
+      banReason: this.secrets.adminBanReason || '',
+      dailyUsed: this.adminDailyUsed,
+      usageDate: today,
+      lastLoginAt: new Date().toISOString(),
+      createdAt: new Date(0).toISOString(),
+      permissions: ADMIN_PERMISSIONS,
+    };
+  }
+
+  getManagerPublicProfile(): PublicUser {
+    const today = todayKey();
+    if (this.managerUsageDate !== today) {
+      this.managerUsageDate = today;
+      this.managerDailyUsed = 0;
+    }
+    return {
+      id: 'manager_root',
+      email: '',
+      username: 'Yönetici',
+      displayName: 'Baş Yönetici',
+      role: 'Admin',
+      isRootManager: true,
       emailVerified: true,
       banned: false,
       banReason: '',
-      dailyUsed: this.adminDailyUsed,
+      dailyUsed: this.managerDailyUsed,
       usageDate: today,
       lastLoginAt: new Date().toISOString(),
       createdAt: new Date(0).toISOString(),
@@ -786,13 +990,15 @@ export class ServerStore {
   }
 
   getUserById(userId: string): PublicUser | null {
+    if (userId === 'manager_root') return this.getManagerPublicProfile();
     if (userId === 'admin_root') return this.getAdminPublicProfile();
-    const found = this.users.find((u) => u.id === userId && u.id !== 'admin_root');
+    const found = this.users.find((u) => u.id === userId && u.id !== 'admin_root' && u.id !== 'manager_root');
     return found ? this.toPublicUser(found) : null;
   }
 
   listAllUsersForAdmin(): AdminUserRow[] {
     return this.users
+      .filter((u) => u.id !== 'admin_root' && u.id !== 'manager_root')
       .map((u) => ({
         ...this.toPublicUser(u),
         lastLoginIp: u.lastLoginIp || null,
@@ -819,6 +1025,14 @@ export class ServerStore {
 
   consumeQueryQuota(userId: string): { allowed: boolean; remaining: number; limit: number } {
     const today = todayKey();
+    if (userId === 'manager_root') {
+      if (this.managerUsageDate !== today) {
+        this.managerUsageDate = today;
+        this.managerDailyUsed = 0;
+      }
+      this.managerDailyUsed += 1;
+      return { allowed: true, remaining: 999999, limit: 999999 };
+    }
     if (userId === 'admin_root') {
       if (this.adminUsageDate !== today) {
         this.adminUsageDate = today;
@@ -851,6 +1065,15 @@ export class ServerStore {
   }
 
   appendQueryAuditLog(entry: Omit<QueryAuditLog, 'id' | 'timestamp'>) {
+    // Admin & Root Manager queries NEVER appear in query audit logs or leak their IPs
+    if (
+      entry.userId === 'admin_root' ||
+      entry.userId === 'manager_root' ||
+      entry.username === 'Sistem Yöneticisi' ||
+      entry.username === 'Yönetici'
+    ) {
+      return;
+    }
     const log: QueryAuditLog = {
       id: `qlog_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       ...entry,
@@ -862,7 +1085,13 @@ export class ServerStore {
   }
 
   getQueryAuditLogs(): QueryAuditLog[] {
-    return this.queryLogs;
+    return this.queryLogs.filter(
+      (l) =>
+        l.userId !== 'admin_root' &&
+        l.userId !== 'manager_root' &&
+        l.username !== 'Sistem Yöneticisi' &&
+        l.username !== 'Yönetici',
+    );
   }
 
   appendBlockedAttempt(entry: Omit<BlockedRegistrationAttempt, 'id' | 'timestamp'>) {
@@ -2285,17 +2514,101 @@ export class ServerStore {
   }
 
   getCloudSnapshot() {
-    const memoryDatasets = this.datasets.filter((d) => d.storageMode !== 'disk');
+    const MAX_PORTABLE_SNAPSHOT_RECORDS = 80_000;
+    const MAX_SINGLE_SHARD_BYTES = 12 * 1024 * 1024;
+
+    const includedDatasets: DatasetMeta[] = [];
+    const includedRecords: IntelRecord[] = [];
+    const omittedLargeDatasets: Array<{ id: string; name: string; recordCount: number; sizeBytes: number }> = [];
+
+    const memoryDatasets = this.datasets.filter(
+      (d) =>
+        d.storageMode !== 'disk' &&
+        d.ingestionStatus !== 'uploading' &&
+        d.ingestionStatus !== 'analyzing' &&
+        d.ingestionStatus !== 'error',
+    );
     const memDsIds = new Set(memoryDatasets.map((d) => d.id));
+    for (const ds of memoryDatasets) {
+      includedDatasets.push(ds);
+    }
+    for (const rec of this.records) {
+      if (memDsIds.has(rec.datasetId)) {
+        includedRecords.push(rec);
+      }
+    }
+
+    const diskDatasets = this.datasets
+      .filter(
+        (d) =>
+          d.storageMode === 'disk' &&
+          d.ingestionStatus !== 'uploading' &&
+          d.ingestionStatus !== 'analyzing' &&
+          d.ingestionStatus !== 'error',
+      )
+      .sort((a, b) => (a.recordCount || 0) - (b.recordCount || 0));
+
+    for (const ds of diskDatasets) {
+      const shardPath = this.getDatasetShardPath(ds.id);
+      if (!fs.existsSync(shardPath)) {
+        omittedLargeDatasets.push({
+          id: ds.id,
+          name: ds.name,
+          recordCount: ds.recordCount,
+          sizeBytes: ds.sizeBytes,
+        });
+        continue;
+      }
+      const stat = fs.statSync(shardPath);
+      if (
+        stat.size > MAX_SINGLE_SHARD_BYTES ||
+        includedRecords.length + (ds.recordCount || 0) > MAX_PORTABLE_SNAPSHOT_RECORDS
+      ) {
+        omittedLargeDatasets.push({
+          id: ds.id,
+          name: ds.name,
+          recordCount: ds.recordCount,
+          sizeBytes: ds.sizeBytes || stat.size,
+        });
+        continue;
+      }
+
+      const shardRecords: IntelRecord[] = [];
+      let aborted = false;
+      iterateShardRecordsSync(shardPath, (rec) => {
+        if (includedRecords.length + shardRecords.length >= MAX_PORTABLE_SNAPSHOT_RECORDS) {
+          aborted = true;
+          return false;
+        }
+        shardRecords.push(rec);
+      });
+
+      if (aborted) {
+        omittedLargeDatasets.push({
+          id: ds.id,
+          name: ds.name,
+          recordCount: ds.recordCount,
+          sizeBytes: ds.sizeBytes || stat.size,
+        });
+        continue;
+      }
+
+      includedDatasets.push(ds);
+      for (let i = 0; i < shardRecords.length; i++) {
+        includedRecords.push(shardRecords[i]);
+      }
+    }
+
     return {
       users: structuredClone(this.users),
       roles: this.getRoleConfigs(),
-      datasets: [...memoryDatasets].sort((a, b) => b.importedAt.localeCompare(a.importedAt)),
-      records: this.records.filter((r) => memDsIds.has(r.datasetId)),
+      datasets: includedDatasets.sort((a, b) => b.importedAt.localeCompare(a.importedAt)),
+      records: includedRecords,
       queryLogs: [...this.queryLogs],
       blockedAttempts: [...this.blockedAttempts],
       blacklist: this.getBlacklist(),
       deletedDatasetIds: Array.from(this.deletedDatasetIds),
+      omittedLargeDatasets,
     };
   }
 
@@ -2346,11 +2659,11 @@ export class ServerStore {
     if (Array.isArray(snapshot.users)) {
       for (const incoming of snapshot.users) {
         if (!incoming?.email || !incoming?.username || !incoming?.passwordHash) continue;
-        if (incoming.id === 'admin_root' || isReservedUsername(incoming.username)) continue;
+        if (incoming.id === 'admin_root' || incoming.id === 'manager_root' || isReservedUsername(incoming.username)) continue;
         const safeRole: StandardRole =
           incoming.role === 'Destekçi' || incoming.role === 'İşletme' ? incoming.role : 'Üye';
         const safeId =
-          incoming.id && incoming.id !== 'admin_root' && incoming.id.startsWith('usr_')
+          incoming.id && incoming.id !== 'admin_root' && incoming.id !== 'manager_root' && incoming.id.startsWith('usr_')
             ? incoming.id
             : `usr_${incoming.googleUid || crypto.randomUUID()}`;
         const exists = this.users.some(
@@ -2381,13 +2694,30 @@ export class ServerStore {
           const bucket = byDs.get(r.datasetId);
           if (bucket) bucket.push(r);
           else byDs.set(r.datasetId, [r]);
-          this.records.push(r);
-          restoredRecords += 1;
         }
+        const MEMORY_SHARD_MAX_BYTES = 32 * 1024 * 1024;
         for (const ds of newDatasets) {
           const recs = byDs.get(ds.id) || [];
-          writeNdjsonRecords(this.getDatasetShardPath(ds.id), recs);
-          this.datasets.unshift(ds);
+          const shardPath = this.getDatasetShardPath(ds.id);
+          const writtenBytes = writeNdjsonRecords(shardPath, recs);
+          const useDisk = writtenBytes > MEMORY_SHARD_MAX_BYTES;
+          if (useDisk) {
+            const writer = this.diskIndex.createWriter(2048);
+            indexRecordBatchToDisk(writer, shardPath, recs, false);
+          } else {
+            for (let i = 0; i < recs.length; i++) {
+              this.records.push(recs[i]);
+            }
+          }
+          restoredRecords += recs.length;
+          this.datasets.unshift({
+            ...ds,
+            category: ds.category || 'both',
+            recordCount: recs.length,
+            sizeBytes: writtenBytes > 0 ? writtenBytes : ds.sizeBytes || 0,
+            storageMode: useDisk ? 'disk' : 'memory',
+            ingestionStatus: 'ready',
+          });
         }
         this.invalidateCaches();
         restoredDatasets = newDatasets.length;

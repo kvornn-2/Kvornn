@@ -8,6 +8,7 @@ export interface RateLimitOptions {
   message?: string;
   violationWeight?: number;
   keyGenerator?: (req: Request) => string;
+  skip?: (req: Request) => boolean;
 }
 
 interface RateBucket {
@@ -137,6 +138,10 @@ export function ipShieldMiddleware(req: Request, res: Response, next: NextFuncti
 
 export function createRateLimiter(options: RateLimitOptions) {
   return (req: Request, res: Response, next: NextFunction) => {
+    if (options.skip?.(req)) {
+      next();
+      return;
+    }
     const ip = getClientIp(req);
     const subject = options.keyGenerator ? options.keyGenerator(req) : ip;
     const key = `${options.keyPrefix}:${subject}`;
@@ -301,6 +306,8 @@ export interface SessionPayload {
   epoch?: string;
   adminGrant?: boolean;
   adminEpoch?: string;
+  managerGrant?: boolean;
+  managerEpoch?: string;
 }
 
 export function signSessionToken(payload: SessionPayload, secret: string): string {
@@ -340,6 +347,15 @@ export function verifyAdminSessionClaim(payload: SessionPayload | null, expected
   if (payload.role !== 'Admin') return false;
   if (payload.adminGrant !== true) return false;
   if (!payload.adminEpoch || payload.adminEpoch !== expectedAdminEpoch) return false;
+  return true;
+}
+
+export function verifyManagerSessionClaim(payload: SessionPayload | null, expectedManagerEpoch: string): boolean {
+  if (!payload) return false;
+  if (payload.userId !== 'manager_root') return false;
+  if (payload.role !== 'Admin') return false;
+  if (payload.managerGrant !== true) return false;
+  if (!payload.managerEpoch || payload.managerEpoch !== expectedManagerEpoch) return false;
   return true;
 }
 

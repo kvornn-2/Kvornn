@@ -17,14 +17,18 @@ import {
   Pencil,
   Download,
   FileUp,
-  Lock,
   FileSpreadsheet,
   FileJson,
   ShieldOff,
   X,
+  KeyRound,
+  RefreshCw,
+  Copy,
+  ShieldCheck,
 } from 'lucide-react';
 import { DatasetEditorModal } from './DatasetEditorModal';
 import type {
+  AdminOversightData,
   AdminUserRow,
   BlockedRegistrationAttempt,
   DatasetMeta,
@@ -49,6 +53,9 @@ import {
   apiAdminRemoveBlacklist,
   apiDeleteDataset,
   apiLoadSyntheticDataset,
+  apiManagerBanAdmin,
+  apiManagerBanAdminIp,
+  apiManagerResetAdminKey,
   apiUpdateRoleConfig,
   apiUpdateUser,
 } from '../utils/api';
@@ -56,7 +63,9 @@ import {
   clearAllMembersFromFirestore,
   connectAdminGoogleAccount,
   deleteDatasetFromFirestore,
+  getConnectedCloudAdminEmail,
   isCloudRootAdminConnected,
+  type AutoSyncResult,
   type CloudBackupSnapshot,
 } from '../utils/firestoreSync';
 import { formatTurkishDate } from '../utils/snowflake';
@@ -68,11 +77,12 @@ interface AdminViewProps {
   refreshSignal?: number;
   cloudSyncStatus?: 'idle' | 'syncing' | 'synced' | 'needs_google' | 'error';
   cloudSyncDetail?: string | null;
+  cloudSyncError?: string | null;
   onRequestCloudSync?: (opts?: {
     pushRoles?: boolean;
     restoreMissing?: boolean;
     forceDatasetIds?: string[];
-  }) => Promise<void>;
+  }) => Promise<{ ok: boolean; error?: string; result?: AutoSyncResult } | void>;
 }
 
 const STANDARD_ROLES: StandardRole[] = ['Üye', 'Destekçi', 'İşletme'];
@@ -84,11 +94,14 @@ export function AdminView({
   refreshSignal = 0,
   cloudSyncStatus = 'idle',
   cloudSyncDetail = null,
+  cloudSyncError = null,
   onRequestCloudSync,
 }: AdminViewProps) {
   const { lang, t } = useI18n();
   const [adminVerified, setAdminVerified] = useState(false);
-  const [subTab, setSubTab] = useState<'datasets' | 'roles' | 'users' | 'database' | 'blacklist'>('datasets');
+  const [isRootManager, setIsRootManager] = useState(false);
+  const [adminOversight, setAdminOversight] = useState<AdminOversightData | null>(null);
+  const [subTab, setSubTab] = useState<'datasets' | 'roles' | 'users' | 'database' | 'blacklist' | 'manager'>('datasets');
   const [datasets, setDatasets] = useState<DatasetMeta[]>([]);
   const [roles, setRoles] = useState<RoleConfigMap | null>(null);
   const [users, setUsers] = useState<AdminUserRow[]>([]);
@@ -97,6 +110,11 @@ export function AdminView({
   const [blacklist, setBlacklist] = useState<QueryBlacklist>({ discordIds: [], emails: [] });
   const [blacklistInput, setBlacklistInput] = useState('');
   const [blacklistBusy, setBlacklistBusy] = useState(false);
+  const [generatedAdminKey, setGeneratedAdminKey] = useState<string | null>(null);
+  const [customAdminKeyInput, setCustomAdminKeyInput] = useState('');
+  const [adminBanReasonInput, setAdminBanReasonInput] = useState('');
+  const [managerBusy, setManagerBusy] = useState(false);
+  const [copiedNewKey, setCopiedNewKey] = useState(false);
   const [dbRecords, setDbRecords] = useState<IntelRecord[]>([]);
   const [dbTotal, setDbTotal] = useState(0);
   const [dbSearch, setDbSearch] = useState('');
@@ -118,6 +136,7 @@ export function AdminView({
   const queryTypeLabel = (qt: QueryAuditLog['queryType']) => {
     if (qt === 'id_lookup') return t('ID Sorgu', 'ID Lookup');
     if (qt === 'email_osint') return t('E-posta OSINT', 'Email OSINT');
+    if (qt === 'ip_lookup') return t('IP Sorgu', 'IP Lookup');
     return t('Toplu Sorgu', 'Bulk Lookup');
   };
 
@@ -126,6 +145,8 @@ export function AdminView({
     try {
       const data = await apiAdminOverview();
       setAdminVerified(true);
+      setIsRootManager(Boolean(data.isRootManager));
+      setAdminOversight(data.isRootManager && data.adminOversight ? data.adminOversight : null);
       setDatasets(data.datasets);
       setRoles(data.roles);
       setUsers(data.users);
@@ -170,7 +191,7 @@ export function AdminView({
     try {
       await apiLoadSyntheticDataset();
       await Promise.all([loadOverview(), onStatsChanged()]);
-      void onRequestCloudSync?.({ restoreMissing: false });
+      if (isRootManager) void onRequestCloudSync?.({ restoreMissing: false });
       setFeedback({ type: 'ok', text: t('Sentetik test veri seti başarıyla eklendi.', 'Synthetic test dataset added successfully.') });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Yükleme başarısız.', 'Upload failed.') });
@@ -182,7 +203,7 @@ export function AdminView({
     try {
       await apiDeleteDataset(id);
       await Promise.all([loadOverview(), onStatsChanged()]);
-      void deleteDatasetFromFirestore(id).catch(() => {});
+      if (isRootManager) void deleteDatasetFromFirestore(id).catch(() => {});
       setFeedback({ type: 'ok', text: t('Veri deposu silindi.', 'Dataset deleted.') });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Silme işlemi başarısız.', 'Delete failed.') });
@@ -210,7 +231,7 @@ export function AdminView({
     try {
       const res = await apiUpdateRoleConfig(role, roles[role]);
       setRoles(res.roles);
-      void onRequestCloudSync?.({ pushRoles: true, restoreMissing: false });
+      if (isRootManager) void onRequestCloudSync?.({ pushRoles: true, restoreMissing: false });
       setFeedback({ type: 'ok', text: t(`${role} rolünün yetki ve hakları güncellendi.`, `Permissions for ${role} updated.`) });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Rol kaydedilemedi.', 'Failed to save role.') });
@@ -222,7 +243,7 @@ export function AdminView({
     try {
       const res = await apiUpdateUser(userId, { role: nextRole });
       setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, ...res.user } : u)));
-      void onRequestCloudSync?.({ restoreMissing: false });
+      if (isRootManager) void onRequestCloudSync?.({ restoreMissing: false });
       setFeedback({ type: 'ok', text: t(`${res.user.username} kullanıcısının rolü ${nextRole} yapıldı.`, `User ${res.user.username} role set to ${nextRole}.`) });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Kullanıcı güncellenemedi.', 'Failed to update user.') });
@@ -236,7 +257,7 @@ export function AdminView({
       setUsers((prev) =>
         prev.map((u) => (u.id === userId ? { ...u, ...res.user } : u)),
       );
-      void onRequestCloudSync?.({ restoreMissing: false });
+      if (isRootManager) void onRequestCloudSync?.({ restoreMissing: false });
       setFeedback({ type: 'ok', text: t(`${res.user.username} e-posta adresi onaylandı.`, `Email approved for ${res.user.username}.`) });
     } catch (err) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Onaylama başarısız.', 'Approval failed.') });
@@ -253,7 +274,7 @@ export function AdminView({
       setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, ...res.user } : u)));
       setBanTargetId(null);
       setBanReason('');
-      void onRequestCloudSync?.({ restoreMissing: false });
+      if (isRootManager) void onRequestCloudSync?.({ restoreMissing: false });
       setFeedback({
         type: 'ok',
         text: banned
@@ -271,7 +292,7 @@ export function AdminView({
       const res = await apiAdminKickAllUsers(clearAccounts);
       setKickConfirmOpen(false);
       await Promise.all([loadOverview(), onStatsChanged()]);
-      if (clearAccounts) {
+      if (clearAccounts && isRootManager) {
         void clearAllMembersFromFirestore().catch(() => {});
       }
       setFeedback({
@@ -297,19 +318,65 @@ export function AdminView({
     try {
       const res = await connectAdminGoogleAccount(apiAdminCloudAuthorize);
       setCloudConnected(res.authorized);
-      await onRequestCloudSync?.({ restoreMissing: true });
+      const syncRes = await onRequestCloudSync?.({ restoreMissing: true });
       await Promise.all([loadOverview(), onStatsChanged()]);
-      setFeedback({
-        type: 'ok',
-        text: t(
-          'Gizli bulut eşitlemesi etkinleştirildi (kimlik e-postası gizli tutuldu).',
-          'Hidden cloud sync enabled (owner email kept private).',
-        ),
-      });
+      if (syncRes && 'ok' in syncRes && !syncRes.ok) {
+        setFeedback({
+          type: 'err',
+          text: syncRes.error || t('Google hesabı bağlandı ancak bulut eşitlemesi tamamlanamadı.', 'Google linked but cloud sync failed.'),
+        });
+      } else {
+        const synced = syncRes && 'result' in syncRes ? syncRes.result : undefined;
+        setFeedback({
+          type: 'ok',
+          text: synced && (synced.restoredDatasets > 0 || synced.restoredUsers > 0 || synced.uploadedDatasets > 0)
+            ? t(
+                `Google hesabı bağlandı (${res.email}) · Geri yüklenen: +${synced.restoredDatasets} depo, +${synced.restoredRecords} kayıt, +${synced.restoredUsers} üye · Buluta yedeklenen: +${synced.uploadedDatasets} depo.`,
+                `Google linked (${res.email}) · Restored: +${synced.restoredDatasets} datasets, +${synced.restoredRecords} records, +${synced.restoredUsers} users · Backed up: +${synced.uploadedDatasets} datasets.`,
+              )
+            : t(
+                `Yönetici Google hesabı bulut kasasına bağlandı ve eşitlendi (${res.email}).`,
+                `Manager Google account connected and synced with cloud vault (${res.email}).`,
+              ),
+        });
+      }
     } catch (err) {
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : t('Bulut bağlantısı doğrulanamadı.', 'Cloud authorization failed.'),
+      });
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleManualCloudSync = async () => {
+    setFeedback(null);
+    setCloudBusy(true);
+    try {
+      const syncRes = await onRequestCloudSync?.({ restoreMissing: true });
+      await Promise.all([loadOverview(), onStatsChanged()]);
+      if (syncRes && 'ok' in syncRes && !syncRes.ok) {
+        setFeedback({
+          type: 'err',
+          text: syncRes.error || t('Bulut eşitlemesi başarısız oldu.', 'Cloud sync failed.'),
+        });
+      } else {
+        const synced = syncRes && 'result' in syncRes ? syncRes.result : undefined;
+        setFeedback({
+          type: 'ok',
+          text: synced
+            ? t(
+                `Bulut eşitlemesi tamamlandı: +${synced.restoredDatasets} depo / +${synced.restoredRecords} kayıt / +${synced.restoredUsers} üye geri yüklendi, +${synced.uploadedDatasets} depo yedeklendi.`,
+                `Cloud sync finished: restored +${synced.restoredDatasets} datasets / +${synced.restoredRecords} records / +${synced.restoredUsers} users, uploaded +${synced.uploadedDatasets} datasets.`,
+              )
+            : t('Bulut eşitlemesi tamamlandı.', 'Cloud sync completed.'),
+        });
+      }
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : t('Bulut eşitlemesi başarısız oldu.', 'Cloud sync failed.'),
       });
     } finally {
       setCloudBusy(false);
@@ -330,11 +397,19 @@ export function AdminView({
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+      const omittedCount = snapshot.omittedLargeDatasets?.length || 0;
+      const omittedNote =
+        omittedCount > 0
+          ? t(
+              ` (${omittedCount} devasa disk deposu .json sınırını aştığı için hariç tutuldu; onları Depolar sekmesinden CSV/JSON indirebilirsiniz.)`,
+              ` (${omittedCount} massive disk datasets exceeded single .json vault cap; export them individually in Datasets tab.)`,
+            )
+          : '';
       setFeedback({
         type: 'ok',
         text: t(
-          `Tam sistem yedeği indirildi (${snapshot.datasets.length} depo, ${snapshot.records.length} kayıt, ${snapshot.users.length} üye).`,
-          `Full portable vault backup downloaded (${snapshot.datasets.length} datasets, ${snapshot.records.length} records, ${snapshot.users.length} members).`,
+          `Tam sistem yedeği indirildi (${snapshot.datasets.length} depo, ${snapshot.records.length} kayıt, ${snapshot.users.length} üye).${omittedNote}`,
+          `Full portable vault backup downloaded (${snapshot.datasets.length} datasets, ${snapshot.records.length} records, ${snapshot.users.length} members).${omittedNote}`,
         ),
       });
     } catch (err) {
@@ -361,7 +436,7 @@ export function AdminView({
       }
       const res = await apiAdminImportCloudSnapshot(parsed);
       await Promise.all([loadOverview(), onStatsChanged()]);
-      void onRequestCloudSync?.({ restoreMissing: false });
+      if (isRootManager) void onRequestCloudSync?.({ restoreMissing: false });
       setFeedback({
         type: 'ok',
         text: t(
@@ -481,6 +556,79 @@ export function AdminView({
     }
   };
 
+  const handleToggleGlobalAdminBan = async (banned: boolean) => {
+    setFeedback(null);
+    setManagerBusy(true);
+    try {
+      const res = await apiManagerBanAdmin(banned, banned ? adminBanReasonInput : '');
+      setAdminOversight(res.adminOversight);
+      if (!banned) setAdminBanReasonInput('');
+      setFeedback({
+        type: 'ok',
+        text: banned
+          ? t('Admin hesabı yasaklandı ve aktif oturumu sonlandırıldı.', 'Admin account banned and active sessions revoked.')
+          : t('Admin hesabı yasağı kaldırıldı.', 'Admin account ban lifted.'),
+      });
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Admin durumu güncellenemedi.', 'Failed to update admin status.') });
+    } finally {
+      setManagerBusy(false);
+    }
+  };
+
+  const handleToggleAdminIpBan = async (ip: string, banned: boolean) => {
+    setFeedback(null);
+    setManagerBusy(true);
+    try {
+      const res = await apiManagerBanAdminIp(ip, banned, banned ? t('Yönetici tarafından engellendi.', 'Banned by Manager.') : '');
+      setAdminOversight(res.adminOversight);
+      setFeedback({
+        type: 'ok',
+        text: banned
+          ? t(`${ip} Admin IP adresi yasaklandı.`, `Admin IP ${ip} banned.`)
+          : t(`${ip} Admin IP yasağı kaldırıldı.`, `Admin IP ${ip} unbanned.`),
+      });
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('IP durumu güncellenemedi.', 'Failed to update IP status.') });
+    } finally {
+      setManagerBusy(false);
+    }
+  };
+
+  const handleResetAdminKey = async (useCustom: boolean) => {
+    setFeedback(null);
+    setManagerBusy(true);
+    setCopiedNewKey(false);
+    try {
+      const res = await apiManagerResetAdminKey(useCustom ? customAdminKeyInput.trim() : undefined);
+      setAdminOversight(res.adminOversight);
+      setGeneratedAdminKey(res.newAdminKey);
+      if (useCustom) setCustomAdminKeyInput('');
+      setFeedback({
+        type: 'ok',
+        text: t(
+          'Admin anahtarı sıfırlandı ve yeni anahtar sisteme yüklendi. Eski Admin oturumları geçersiz kılındı.',
+          'Admin key was reset and activated. Previous Admin sessions were invalidated.',
+        ),
+      });
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : t('Admin anahtarı sıfırlanamadı.', 'Failed to reset Admin key.') });
+    } finally {
+      setManagerBusy(false);
+    }
+  };
+
+  const handleCopyGeneratedAdminKey = async () => {
+    if (!generatedAdminKey) return;
+    try {
+      await navigator.clipboard.writeText(generatedAdminKey);
+      setCopiedNewKey(true);
+      setTimeout(() => setCopiedNewKey(false), 2000);
+    } catch {
+      // Ignore clipboard failures
+    }
+  };
+
   if (!adminVerified) {
     return (
       <div className="flex h-40 items-center justify-center rounded-xl border border-slate-200 bg-white text-xs text-slate-500 dark:border-slate-800 dark:bg-[#111827] dark:text-slate-400">
@@ -568,6 +716,21 @@ export function AdminView({
               {t('Kara Liste', 'Blacklist')} ({blacklist.discordIds.length + blacklist.emails.length})
             </span>
           </button>
+          {isRootManager && adminOversight && (
+            <button
+              type="button"
+              data-testid="admin-tab-manager"
+              onClick={() => setSubTab('manager')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                subTab === 'manager'
+                  ? 'bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white'
+                  : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'
+              }`}
+            >
+              <ShieldCheck className="h-3.5 w-3.5 text-amber-500" />
+              <span>{t('Yönetici Denetimi', 'Manager Control')}</span>
+            </button>
+          )}
         </div>
       </section>
 
@@ -591,92 +754,6 @@ export function AdminView({
         <>
           {subTab === 'datasets' && (
             <div className="space-y-4">
-              <div
-                data-testid="accountless-persistence-card"
-                className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-5 py-4 dark:border-slate-800 dark:bg-[#111827]"
-              >
-                <div className="flex items-start gap-2.5 text-xs">
-                  <Lock className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="font-semibold text-slate-900 dark:text-slate-100">
-                        {t(
-                          'Hesapsız Kalıcılık & Taşınabilir Yedek Kasası',
-                          'Accountless Persistence & Portable Vault',
-                        )}
-                      </p>
-                      <span className="rounded bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
-                        {t('3 Ortak · E-postasız Erişim', '3 Partners · Zero Email')}
-                      </span>
-                    </div>
-                    <p className="mt-1 max-w-2xl text-slate-500 dark:text-slate-400">
-                      {cloudSyncStatus === 'syncing'
-                        ? t(
-                            'Arka plan eşitlemesi çalışıyor...',
-                            'Background sync in progress...',
-                          )
-                        : isCloudRootAdminConnected() || cloudConnected
-                          ? cloudSyncDetail ||
-                            t(
-                              'Admin erişimi yalnızca 30 haneli paylaşımlı anahtar ile hesapsız çalışır (e-postanız gizlidir). Sunucu diskinde NDJSON parçalama aktiftir; ayrıca hesap gerekmeden tam yedek alıp geri yükleyebilirsiniz.',
-                              'Admin access works accountlessly via the 30-digit shared key (no email exposed). Disk NDJSON sharding is active, plus 1-click portable vault export/restore.',
-                            )
-                          : t(
-                              'Admin erişimi hesapsızdır ve yönetici e-postası hiçbir yerde görünmez. Tüm ortaklar 30 haneli anahtarla girip sunucu diskinde saklanan verilere erişir veya hesap gerekmeden taşınabilir JSON yedek indirip geri yükleyebilir.',
-                              'Admin access is accountless and hides owner email everywhere. All partners use the 30-digit key and can download/restore full JSON vault backups with zero account.',
-                            )}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    ref={restoreInputRef}
-                    type="file"
-                    accept=".json,application/json"
-                    onChange={handleRestoreBackup}
-                    className="hidden"
-                  />
-                  <button
-                    type="button"
-                    data-testid="download-vault-btn"
-                    disabled={vaultBusy}
-                    onClick={handleDownloadBackup}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700 whitespace-nowrap"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                    <span>{t('Tam Yedek İndir (.json)', 'Download Full Vault (.json)')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    data-testid="restore-vault-btn"
-                    disabled={vaultBusy}
-                    onClick={() => restoreInputRef.current?.click()}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700 whitespace-nowrap"
-                  >
-                    <FileUp className="h-3.5 w-3.5" />
-                    <span>{t('Yedekten Geri Yükle', 'Restore Vault')}</span>
-                  </button>
-                  {isCloudRootAdminConnected() || cloudConnected ? (
-                    <span className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
-                      <Cloud className="h-3.5 w-3.5" />
-                      <span>{t('Gizli Bulut Bağlı', 'Private Cloud Active')}</span>
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      data-testid="firestore-connect-btn"
-                      disabled={cloudBusy}
-                      onClick={handleConnectCloudAdmin}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-blue-300/80 bg-blue-50/70 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100 disabled:opacity-50 dark:border-blue-800/80 dark:bg-blue-950/30 dark:text-blue-300 whitespace-nowrap"
-                    >
-                      <Cloud className="h-3.5 w-3.5" />
-                      <span>{t('Gizli Bulut Eşitle (Opsiyonel)', 'Sync Private Cloud (Optional)')}</span>
-                    </button>
-                  )}
-                </div>
-              </div>
-
               <div className="flex flex-wrap items-center justify-between gap-2.5">
                 {datasets.length > 0 ? (
                   <div className="flex flex-wrap items-center gap-2">
@@ -1430,6 +1507,363 @@ export function AdminView({
               </div>
             </div>
           )}
+
+          {subTab === 'manager' && isRootManager && adminOversight && (
+            <div className="space-y-6" data-testid="manager-oversight-panel">
+              <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+                <section
+                  data-testid="manager-cloud-sync-card"
+                  className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111827] sm:p-6"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        {t('Yönetici Bulut Eşitleme ve Veri Geri Yükleme', 'Manager Cloud Sync & Recovery')}
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                        {t(
+                          'Yetkili Yönetici Google hesabınızı bağladığınızda tüm üyeler, rol yetkileri ve 12.500 kayıt altındaki veri depoları Firebase Firestore’a yedeklenir ve sunucu yeniden başlasa dahi geri yüklenir.',
+                          'Link an authorized Manager Google account to sync members, role permissions, and datasets under 12,500 records to Firestore and restore across restarts.',
+                        )}
+                      </p>
+                    </div>
+                    <Cloud className="h-5 w-5 shrink-0 text-blue-500" />
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
+                    {isCloudRootAdminConnected() || cloudConnected ? (
+                      <span className="inline-flex items-center gap-1.5 rounded border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 font-semibold text-emerald-700 dark:text-emerald-400">
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        <span>
+                          {t('Hesap Bağlı:', 'Connected:')}{' '}
+                          {getConnectedCloudAdminEmail() || t('Yetkili Yönetici', 'Authorized Manager')}
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1.5 rounded border border-slate-300 bg-slate-100 px-2.5 py-1 font-medium text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                        <span>{t('Google hesabı bağlı değil', 'Google account not connected')}</span>
+                      </span>
+                    )}
+                    {cloudSyncStatus === 'syncing' && (
+                      <span className="font-medium text-blue-600 dark:text-blue-400">
+                        {t('Eşitleniyor...', 'Syncing...')}
+                      </span>
+                    )}
+                  </div>
+
+                  {cloudSyncError ? (
+                    <div className="mt-3 rounded-lg border border-red-200 bg-red-50/80 p-3 text-xs text-red-800 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
+                      {cloudSyncError}
+                    </div>
+                  ) : cloudSyncDetail ? (
+                    <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-300">
+                      {cloudSyncDetail}
+                    </div>
+                  ) : null}
+
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    {isCloudRootAdminConnected() || cloudConnected ? (
+                      <>
+                        <button
+                          type="button"
+                          data-testid="firestore-manual-sync-btn"
+                          disabled={cloudBusy || cloudSyncStatus === 'syncing'}
+                          onClick={handleManualCloudSync}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" />
+                          <span>{t('Bulut ile Eşitle ve Verileri Geri Yükle', 'Sync & Restore from Cloud')}</span>
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="firestore-connect-btn"
+                          disabled={cloudBusy}
+                          onClick={handleConnectCloudAdmin}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+                        >
+                          <Cloud className="h-3.5 w-3.5" />
+                          <span>{t('Hesap Değiştir', 'Switch Account')}</span>
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        data-testid="firestore-connect-btn"
+                        disabled={cloudBusy}
+                        onClick={handleConnectCloudAdmin}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                      >
+                        <Cloud className="h-3.5 w-3.5" />
+                        <span>{t('Google Hesabı Bağla ve Bulutla Eşitle', 'Connect Google & Sync Cloud')}</span>
+                      </button>
+                    )}
+                  </div>
+                </section>
+
+                <section
+                  data-testid="manager-vault-card"
+                  className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111827] sm:p-6"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        {t('Yönetici Tam Yedek Kasası (.json)', 'Manager Full Vault Backup (.json)')}
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                        {t(
+                          'Yalnızca Yönetici anahtarına özeldir. Tüm uygun disk/bellek veri depolarını, kayıtlı üyeleri, rol yetkilerini ve kara listeyi tek .json dosyası olarak indirip istediğiniz zaman geri yükleyin.',
+                          'Exclusive to the Manager Key. Download or restore datasets, members, role permissions, and the blacklist as a single portable .json vault.',
+                        )}
+                      </p>
+                    </div>
+                    <Download className="h-5 w-5 shrink-0 text-emerald-500" />
+                  </div>
+
+                  <div className="mt-5 flex flex-wrap items-center gap-2.5">
+                    <input
+                      ref={restoreInputRef}
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={handleRestoreBackup}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      data-testid="download-vault-btn"
+                      disabled={vaultBusy}
+                      onClick={handleDownloadBackup}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>{vaultBusy ? t('Hazırlanıyor...', 'Preparing...') : t('Tam Yedek İndir (.json)', 'Download Full Vault (.json)')}</span>
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="restore-vault-btn"
+                      disabled={vaultBusy}
+                      onClick={() => restoreInputRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+                    >
+                      <FileUp className="h-3.5 w-3.5" />
+                      <span>{t('Yedekten Geri Yükle', 'Restore Vault')}</span>
+                    </button>
+                  </div>
+                </section>
+              </div>
+
+              <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+                <section className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111827] sm:p-6">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        {t('Admin Hesabı Erişim & Yasaklama Kontrolü', 'Admin Account Access & Ban Control')}
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                        {t(
+                          'Standart Admin anahtarıyla giriş yapan tüm Admin erişimini tek tıkla yasaklayabilir veya tekrar açabilirsiniz. Yasaklandığında aktif Admin oturumları anında sonlanır.',
+                          'Ban or restore the Admin tier globally with a single click. Banning immediately revokes active Admin tokens.',
+                        )}
+                      </p>
+                    </div>
+                    <span
+                      className={`shrink-0 rounded border px-2.5 py-1 text-[11px] font-semibold ${
+                        adminOversight.adminBanned
+                          ? 'border-red-300 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300'
+                          : 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300'
+                      }`}
+                    >
+                      {adminOversight.adminBanned ? t('Admin Yasaklı', 'Admin Banned') : t('Admin Aktif', 'Admin Active')}
+                    </span>
+                  </div>
+
+                  {adminOversight.adminBanned ? (
+                    <div className="mt-4 space-y-3 rounded-lg border border-red-200 bg-red-50/70 p-4 text-xs text-red-900 dark:border-red-900/50 dark:bg-red-950/25 dark:text-red-200">
+                      <div>
+                        <span className="font-semibold">{t('Yasak Nedeni:', 'Ban Reason:')}</span>{' '}
+                        {adminOversight.adminBanReason || '—'}
+                      </div>
+                      <button
+                        type="button"
+                        disabled={managerBusy}
+                        onClick={() => handleToggleGlobalAdminBan(false)}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        <span>{t('Admin Yasağını Kaldır', 'Unban Admin Account')}</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                      <input
+                        type="text"
+                        value={adminBanReasonInput}
+                        onChange={(e) => setAdminBanReasonInput(e.target.value)}
+                        placeholder={t('Yasaklama nedeni (opsiyonel)...', 'Ban reason (optional)...')}
+                        className="flex-1 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-xs text-slate-900 focus:border-red-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      />
+                      <button
+                        type="button"
+                        data-testid="manager-ban-admin-btn"
+                        disabled={managerBusy}
+                        onClick={() => handleToggleGlobalAdminBan(true)}
+                        className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-red-600 px-4 py-2 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <Ban className="h-3.5 w-3.5" />
+                        <span>{t('Admin Hesabını Yasakla', 'Ban Admin Account')}</span>
+                      </button>
+                    </div>
+                  )}
+                </section>
+
+                <section className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-[#111827] sm:p-6">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        {t('Admin Anahtarı Sıfırlama & Oto Yükleme', 'Admin Key Reset & Auto-Rotation')}
+                      </h3>
+                      <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                        {t(
+                          'Yeni 30 haneli CSPRNG Admin anahtarını otomatik üretip sisteme yükleyin veya kendi 30 haneli anahtarınızı tanımlayın.',
+                          'Auto-generate and activate a fresh 30-digit CSPRNG Admin key, or assign your own custom 30-digit key.',
+                        )}
+                      </p>
+                    </div>
+                    <KeyRound className="h-5 w-5 shrink-0 text-amber-500" />
+                  </div>
+
+                  {adminOversight.adminKeyUpdatedAt && (
+                    <div className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                      {t('Son Anahtar Değişikliği:', 'Last Key Rotation:')} {formatTurkishDate(adminOversight.adminKeyUpdatedAt)}
+                    </div>
+                  )}
+
+                  <div className="mt-4 space-y-3">
+                    <button
+                      type="button"
+                      data-testid="manager-auto-reset-key-btn"
+                      disabled={managerBusy}
+                      onClick={() => handleResetAdminKey(false)}
+                      className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-amber-600 px-4 py-2.5 text-xs font-semibold text-white transition-colors hover:bg-amber-700 disabled:opacity-50"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      <span>{t('Oto Yeni 30 Haneli Admin Key Oluştur ve Yükle', 'Auto-Generate & Load New 30-Digit Admin Key')}</span>
+                    </button>
+
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={30}
+                        value={customAdminKeyInput}
+                        onChange={(e) => setCustomAdminKeyInput(e.target.value.replace(/\D/g, '').slice(0, 30))}
+                        placeholder={t('Veya özel 30 haneli sayısal key girin...', 'Or enter custom 30-digit numeric key...')}
+                        className="flex-1 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 font-mono text-xs text-slate-900 focus:border-blue-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      />
+                      <button
+                        type="button"
+                        disabled={managerBusy || customAdminKeyInput.length !== 30}
+                        onClick={() => handleResetAdminKey(true)}
+                        className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700 whitespace-nowrap"
+                      >
+                        {t('Özel Key Yükle', 'Apply Custom Key')} ({customAdminKeyInput.length}/30)
+                      </button>
+                    </div>
+
+                    {generatedAdminKey && (
+                      <div
+                        data-testid="manager-new-admin-key-box"
+                        className="rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-xs text-emerald-950 dark:border-emerald-800 dark:bg-emerald-950/35 dark:text-emerald-200"
+                      >
+                        <div className="flex items-center justify-between gap-2 font-semibold">
+                          <span>{t('Aktif Yeni Admin Anahtarı (Hemen Kopyalayın):', 'New Active Admin Key (Copy Now):')}</span>
+                          <button
+                            type="button"
+                            onClick={handleCopyGeneratedAdminKey}
+                            className="inline-flex items-center gap-1 rounded border border-emerald-400/60 bg-white/80 px-2 py-0.5 text-[11px] font-semibold text-emerald-800 hover:bg-white dark:border-emerald-700 dark:bg-slate-900 dark:text-emerald-300"
+                          >
+                            <Copy className="h-3 w-3" />
+                            <span>{copiedNewKey ? t('Kopyalandı', 'Copied') : t('Kopyala', 'Copy')}</span>
+                          </button>
+                        </div>
+                        <div className="mt-1.5 select-all break-all font-mono text-sm font-bold tracking-wider">
+                          {generatedAdminKey}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              </div>
+
+              <section className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-[#111827]">
+                <div className="border-b border-slate-200 px-5 py-4 dark:border-slate-800">
+                  <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
+                    {t('Admin Giriş ve İşlem IP Kayıtları', 'Tracked Admin Login & Activity IPs')} ({adminOversight.trackedIps.length})
+                  </h3>
+                  <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                    {t(
+                      'Standart Admin hesabının giriş yaptığı ve sorgu çalıştırdığı IP adresleri yalnızca Yönetici panelinde görünür. İstediğiniz Admin IP adresini buradan banlayabilirsiniz.',
+                      'IP addresses used by standard Admin sessions appear exclusively here in the Manager panel. You can ban or unban any Admin IP immediately.',
+                    )}
+                  </p>
+                </div>
+
+                {adminOversight.trackedIps.length === 0 ? (
+                  <div className="p-8 text-center text-xs text-slate-500 dark:text-slate-400">
+                    {t('Henüz kaydedilmiş Admin IP adresi yok.', 'No Admin IP addresses recorded yet.')}
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead className="border-b border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-800 dark:bg-slate-900/60 dark:text-slate-400">
+                        <tr>
+                          <th className="px-4 py-3 font-semibold">Admin IP</th>
+                          <th className="px-4 py-3 font-semibold">{t('İlk Görülme', 'First Seen')}</th>
+                          <th className="px-4 py-3 font-semibold">{t('Son İşlem', 'Last Seen')}</th>
+                          <th className="px-4 py-3 text-right font-semibold">{t('Giriş', 'Logins')}</th>
+                          <th className="px-4 py-3 text-right font-semibold">{t('Sorgu', 'Queries')}</th>
+                          <th className="px-4 py-3 font-semibold">{t('Durum', 'Status')}</th>
+                          <th className="px-4 py-3 text-right font-semibold">{t('İşlem', 'Action')}</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                        {adminOversight.trackedIps.map((row) => (
+                          <tr key={row.ip} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/30">
+                            <td className="px-4 py-3 font-mono font-semibold text-slate-900 dark:text-slate-100">{row.ip}</td>
+                            <td className="px-4 py-3 text-slate-500 dark:text-slate-400">{formatTurkishDate(row.firstSeenAt)}</td>
+                            <td className="px-4 py-3 text-slate-600 dark:text-slate-300">{formatTurkishDate(row.lastSeenAt)}</td>
+                            <td className="px-4 py-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{row.loginCount}</td>
+                            <td className="px-4 py-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{row.queryCount}</td>
+                            <td className="px-4 py-3">
+                              {row.banned ? (
+                                <span className="font-semibold text-red-600 dark:text-red-400">{t('IP Yasaklı', 'IP Banned')}</span>
+                              ) : (
+                                <span className="font-semibold text-emerald-600 dark:text-emerald-400">{t('İzinli', 'Allowed')}</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-right whitespace-nowrap">
+                              <button
+                                type="button"
+                                disabled={managerBusy}
+                                onClick={() => handleToggleAdminIpBan(row.ip, !row.banned)}
+                                className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-[11px] font-semibold disabled:opacity-50 ${
+                                  row.banned
+                                    ? 'border-emerald-300 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-400 dark:hover:bg-emerald-950/30'
+                                    : 'border-red-300 text-red-600 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950/40'
+                                }`}
+                              >
+                                <Ban className="h-3 w-3" />
+                                <span>{row.banned ? t('IP Yasağını Kaldır', 'Unban IP') : t('IP Yasakla', 'Ban IP')}</span>
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            </div>
+          )}
         </>
       )}
 
@@ -1438,7 +1872,7 @@ export function AdminView({
         onClose={() => setEditingDataset(null)}
         onDatasetChanged={async (datasetId) => {
           await Promise.all([loadOverview(), onStatsChanged()]);
-          void onRequestCloudSync?.({ restoreMissing: false, forceDatasetIds: [datasetId] });
+          if (isRootManager) void onRequestCloudSync?.({ restoreMissing: false, forceDatasetIds: [datasetId] });
         }}
       />
     </div>

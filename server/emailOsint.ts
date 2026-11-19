@@ -1,10 +1,50 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
-import type { EmailOsintReport, EmailOsintSourceResult, IntelRecord } from '../src/types/intel.ts';
-import { searchRecords, type SearchIndex } from '../src/utils/search.ts';
+import type {
+  EmailOsintIdentitySummary,
+  EmailOsintReport,
+  EmailOsintSourceResult,
+  IntelRecord,
+} from '../src/types/intel.ts';
+import {
+  extractRecordExtraIdentifiers,
+  extractRecordIps,
+  extractRecordPhones,
+  extractRecordSnowflakes,
+  isTimestampLikeValue,
+  searchRecords,
+  type SearchIndex,
+} from '../src/utils/search.ts';
 import { checkDisposableEmail } from './disposable.ts';
 
 type Lang = 'tr' | 'en';
+
+const ROLE_PREFIX_RE =
+  /^(admin|administrator|postmaster|hostmaster|webmaster|abuse|security|noc|support|help|info|contact|sales|billing|noreply|no-reply|hello|team|hr)$/i;
+
+function computeCanonicalEmail(email: string): { canonical: string; isRoleAddress: boolean } {
+  const [localRaw = '', domain = ''] = email.trim().toLowerCase().split('@');
+  const plusIdx = localRaw.indexOf('+');
+  const baseLocal = plusIdx >= 0 ? localRaw.slice(0, plusIdx) : localRaw;
+  const isRoleAddress = ROLE_PREFIX_RE.test(baseLocal);
+  if (domain === 'gmail.com' || domain === 'googlemail.com') {
+    const dotless = baseLocal.replace(/\./g, '');
+    return { canonical: `${dotless}@gmail.com`, isRoleAddress };
+  }
+  return { canonical: `${baseLocal}@${domain}`, isRoleAddress };
+}
+
+function evaluateSpoofingRisk(spfRecord: string | null, dmarcRecord: string | null): 'low' | 'medium' | 'high' {
+  const spfLower = (spfRecord || '').toLowerCase();
+  const dmarcLower = (dmarcRecord || '').toLowerCase();
+  const hasStrictSpf = spfLower.includes('-all');
+  const hasSoftSpf = Boolean(spfRecord) && (spfLower.includes('~all') || spfLower.includes('?all'));
+  const hasRejectDmarc = /p=(reject|quarantine)/i.test(dmarcLower);
+
+  if (hasStrictSpf && hasRejectDmarc) return 'low';
+  if (spfRecord || dmarcRecord || hasSoftSpf) return 'medium';
+  return 'high';
+}
 
 function detectMailProvider(mxHosts: string[], domain: string, lang: Lang): string {
   const joined = mxHosts.join(' ').toLowerCase();
@@ -302,8 +342,6 @@ async function checkProxyNovaComb(email: string, lang: Lang): Promise<EmailOsint
     const data = (await res.json()) as { count?: number; lines?: string[] };
     const normalizedEmail = email.trim().toLowerCase();
     const rawLines = Array.isArray(data.lines) ? data.lines.map((l) => String(l).trim()).filter(Boolean) : [];
-    // ProxyNova splits on '@' and returns domain/substring matches up to 10,000.
-    // Keep strictly exact matches for the queried email so unrelated addresses never inflate results.
     const exactLines = rawLines.filter((line) => {
       const lower = line.toLowerCase();
       return lower === normalizedEmail || lower.startsWith(`${normalizedEmail}:`) || lower.startsWith(`${normalizedEmail};`);
@@ -443,25 +481,152 @@ async function checkOpenPgp(email: string, lang: Lang): Promise<EmailOsintSource
   }
 }
 
-async function checkGravatar(email: string, lang: Lang): Promise<EmailOsintSourceResult> {
-  const srcName = lang === 'tr' ? 'Gravatar Genel Profili' : 'Gravatar Public Profile';
-  const hash = crypto.createHash('sha256').update(email.trim().toLowerCase()).digest('hex');
-  const md5 = crypto.createHash('md5').update(email.trim().toLowerCase()).digest('hex');
+interface UbuntuPgpResult {
+  check: EmailOsintSourceResult;
+  uids: string[];
+  altEmails: string[];
+}
+
+async function checkUbuntuKeyserver(email: string, lang: Lang): Promise<UbuntuPgpResult> {
+  const srcName = 'Ubuntu / SKS PGP Keyserver';
   try {
-    const res = await fetchWithTimeout(`https://en.gravatar.com/${hash}.json`, {}, 4200);
+    const res = await fetchWithTimeout(
+      `https://keyserver.ubuntu.com/pks/lookup?op=index&options=mr&search=${encodeURIComponent(email)}`,
+      {},
+      4200,
+    );
     if (res.status === 404) {
       return {
-        source: srcName,
-        status: 'not_found',
-        summary:
-          lang === 'tr'
-            ? 'Bu e-posta ile eşleşen Gravatar profili bulunamadı.'
-            : 'No public Gravatar profile matched this email.',
-        details: { sha256: hash, md5 },
+        check: {
+          source: srcName,
+          status: 'not_found',
+          summary: lang === 'tr' ? 'Ubuntu PGP anahtar arşivinde kayıt yok.' : 'No public PGP key on keyserver.ubuntu.com.',
+          details: {},
+        },
+        uids: [],
+        altEmails: [],
       };
     }
     if (!res.ok) {
-      return { source: srcName, status: 'error', summary: `HTTP ${res.status}`, details: { sha256: hash } };
+      return {
+        check: { source: srcName, status: 'error', summary: `HTTP ${res.status}`, details: {} },
+        uids: [],
+        altEmails: [],
+      };
+    }
+    const text = await res.text();
+    const lines = text.split('\n');
+    const pubKeys = lines.filter((l) => l.startsWith('pub:'));
+    const uidLines = lines.filter((l) => l.startsWith('uid:'));
+    if (pubKeys.length === 0 && uidLines.length === 0) {
+      return {
+        check: {
+          source: srcName,
+          status: 'not_found',
+          summary: lang === 'tr' ? 'PGP anahtarı bulunamadı.' : 'No PGP key found.',
+          details: {},
+        },
+        uids: [],
+        altEmails: [],
+      };
+    }
+
+    const decodedUids: string[] = [];
+    const altEmails = new Set<string>();
+    const emailRe = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+    for (const line of uidLines.slice(0, 12)) {
+      const rawUid = line.split(':')[1] || '';
+      let uidStr = rawUid;
+      try {
+        uidStr = decodeURIComponent(rawUid);
+      } catch {
+        uidStr = rawUid;
+      }
+      if (uidStr && !decodedUids.includes(uidStr)) {
+        decodedUids.push(uidStr);
+        const matches = uidStr.match(emailRe);
+        if (matches) {
+          matches.forEach((m) => altEmails.add(m.toLowerCase()));
+        }
+      }
+    }
+
+    const fingerprints = pubKeys
+      .slice(0, 5)
+      .map((l) => {
+        const parts = l.split(':');
+        const fp = parts[1] || '';
+        const ts = Number(parts[4] || 0);
+        const dt = ts > 0 ? new Date(ts * 1000).toISOString().slice(0, 10) : '';
+        return dt ? `${fp} (${dt})` : fp;
+      })
+      .filter(Boolean);
+
+    return {
+      check: {
+        source: srcName,
+        status: 'found',
+        summary:
+          lang === 'tr'
+            ? `${pubKeys.length} PGP anahtarı ve ${decodedUids.length} kimlik (UID) etiketi bulundu.`
+            : `Found ${pubKeys.length} PGP key(s) and ${decodedUids.length} UID label(s).`,
+        details: {
+          ...(decodedUids.length > 0 ? { [lang === 'tr' ? 'kimlikEtiketleri' : 'pgpUids']: decodedUids } : {}),
+          ...(fingerprints.length > 0 ? { [lang === 'tr' ? 'anahtarlar' : 'keys']: fingerprints } : {}),
+        },
+      },
+      uids: decodedUids,
+      altEmails: Array.from(altEmails),
+    };
+  } catch {
+    return {
+      check: {
+        source: srcName,
+        status: 'error',
+        summary: lang === 'tr' ? 'Ubuntu PGP sunucusu yanıt vermedi.' : 'Ubuntu PGP server timed out.',
+        details: {},
+      },
+      uids: [],
+      altEmails: [],
+    };
+  }
+}
+
+interface GravatarRes {
+  check: EmailOsintSourceResult;
+  names: string[];
+  usernames: string[];
+  emails: string[];
+  locations: string[];
+}
+
+async function checkGravatar(email: string, lang: Lang): Promise<GravatarRes> {
+  const srcName = lang === 'tr' ? 'Gravatar Genel Profili' : 'Gravatar Public Profile';
+  const hash = crypto.createHash('sha256').update(email.trim().toLowerCase()).digest('hex');
+  const md5 = crypto.createHash('md5').update(email.trim().toLowerCase()).digest('hex');
+  const empty: GravatarRes = {
+    check: {
+      source: srcName,
+      status: 'not_found',
+      summary:
+        lang === 'tr'
+          ? 'Bu e-posta ile eşleşen Gravatar profili bulunamadı.'
+          : 'No public Gravatar profile matched this email.',
+      details: { sha256: hash, md5 },
+    },
+    names: [],
+    usernames: [],
+    emails: [],
+    locations: [],
+  };
+  try {
+    const res = await fetchWithTimeout(`https://en.gravatar.com/${hash}.json`, {}, 4200);
+    if (res.status === 404) return empty;
+    if (!res.ok) {
+      return {
+        ...empty,
+        check: { source: srcName, status: 'error', summary: `HTTP ${res.status}`, details: { sha256: hash } },
+      };
     }
     const data = (await res.json()) as {
       entry?: Array<{
@@ -479,12 +644,23 @@ async function checkGravatar(email: string, lang: Lang): Promise<EmailOsintSourc
     const entry = data.entry?.[0];
     if (!entry) {
       return {
-        source: srcName,
-        status: 'not_found',
-        summary: lang === 'tr' ? 'Gravatar profili boş döndü.' : 'Gravatar profile empty.',
-        details: { sha256: hash, md5 },
+        ...empty,
+        check: {
+          source: srcName,
+          status: 'not_found',
+          summary: lang === 'tr' ? 'Gravatar profili boş döndü.' : 'Gravatar profile empty.',
+          details: { sha256: hash, md5 },
+        },
       };
     }
+
+    const names = entry.displayName ? [entry.displayName] : [];
+    const usernames = [
+      ...(entry.preferredUsername ? [entry.preferredUsername] : []),
+      ...((entry.accounts || []).map((a) => a.username).filter(Boolean) as string[]),
+    ];
+    const emails = (entry.emails || []).map((e) => e.value).filter(Boolean) as string[];
+    const locations = entry.currentLocation ? [entry.currentLocation] : [];
 
     const details: Record<string, string | string[]> = {
       [lang === 'tr' ? 'gorunenAd' : 'displayName']: entry.displayName || '—',
@@ -497,9 +673,8 @@ async function checkGravatar(email: string, lang: Lang): Promise<EmailOsintSourc
     if (entry.aboutMe) {
       details[lang === 'tr' ? 'hakkimda' : 'bio'] = entry.aboutMe;
     }
-    if (Array.isArray(entry.emails) && entry.emails.length > 0) {
-      const ems = entry.emails.map((e) => e.value).filter(Boolean) as string[];
-      if (ems.length > 0) details[lang === 'tr' ? 'epostalar' : 'emails'] = ems;
+    if (emails.length > 0) {
+      details[lang === 'tr' ? 'epostalar' : 'emails'] = emails;
     }
     if (Array.isArray(entry.phoneNumbers) && entry.phoneNumbers.length > 0) {
       const phones = entry.phoneNumbers.map((p) => (p.type ? `${p.type}: ${p.value}` : p.value || '')).filter(Boolean);
@@ -515,26 +690,58 @@ async function checkGravatar(email: string, lang: Lang): Promise<EmailOsintSourc
     }
 
     return {
-      source: srcName,
-      status: 'found',
-      summary:
-        lang === 'tr'
-          ? `Gravatar profili tespit edildi: ${entry.displayName || entry.preferredUsername || 'Profil Mevcut'}`
-          : `Gravatar profile found: ${entry.displayName || entry.preferredUsername || 'Available'}`,
-      details,
+      check: {
+        source: srcName,
+        status: 'found',
+        summary:
+          lang === 'tr'
+            ? `Gravatar profili tespit edildi: ${entry.displayName || entry.preferredUsername || 'Profil Mevcut'}`
+            : `Gravatar profile found: ${entry.displayName || entry.preferredUsername || 'Available'}`,
+        details,
+      },
+      names,
+      usernames,
+      emails,
+      locations,
     };
   } catch {
     return {
-      source: srcName,
-      status: 'error',
-      summary: lang === 'tr' ? 'Gravatar API servisine ulaşılamadı.' : 'Could not reach Gravatar API.',
-      details: { sha256: hash },
+      ...empty,
+      check: {
+        source: srcName,
+        status: 'error',
+        summary: lang === 'tr' ? 'Gravatar API servisine ulaşılamadı.' : 'Could not reach Gravatar API.',
+        details: { sha256: hash },
+      },
     };
   }
 }
 
-async function checkGitHub(email: string, lang: Lang): Promise<EmailOsintSourceResult> {
+interface GitHubRes {
+  check: EmailOsintSourceResult;
+  names: string[];
+  usernames: string[];
+  emails: string[];
+  locations: string[];
+}
+
+async function checkGitHub(email: string, lang: Lang): Promise<GitHubRes> {
   const srcName = lang === 'tr' ? 'GitHub Genel Arama' : 'GitHub Public Search';
+  const empty: GitHubRes = {
+    check: {
+      source: srcName,
+      status: 'not_found',
+      summary:
+        lang === 'tr'
+          ? 'Herkese açık GitHub profillerinde veya commit kayıtlarında bu e-posta eşleşmedi.'
+          : 'No public GitHub profiles or commits matched this email.',
+      details: {},
+    },
+    names: [],
+    usernames: [],
+    emails: [],
+    locations: [],
+  };
   try {
     const [usersRes, commitsRes] = await Promise.all([
       fetchWithTimeout(`https://api.github.com/search/users?q=${encodeURIComponent(`${email} in:email`)}`, {}, 4500),
@@ -547,10 +754,8 @@ async function checkGitHub(email: string, lang: Lang): Promise<EmailOsintSourceR
 
     if (!usersRes.ok) {
       return {
-        source: srcName,
-        status: 'error',
-        summary: `HTTP ${usersRes.status}`,
-        details: {},
+        ...empty,
+        check: { source: srcName, status: 'error', summary: `HTTP ${usersRes.status}`, details: {} },
       };
     }
 
@@ -574,18 +779,9 @@ async function checkGitHub(email: string, lang: Lang): Promise<EmailOsintSourceR
     const commitItems = commitData?.items || [];
 
     if ((!userData.total_count || userItems.length === 0) && (!commitData?.total_count || commitItems.length === 0)) {
-      return {
-        source: srcName,
-        status: 'not_found',
-        summary:
-          lang === 'tr'
-            ? 'Herkese açık GitHub profillerinde veya commit kayıtlarında bu e-posta eşleşmedi.'
-            : 'No public GitHub profiles or commits matched this email.',
-        details: {},
-      };
+      return empty;
     }
 
-    // Enrich up to 5 matched GitHub profiles with full public metadata (email, location/address, company, blog, bio, twitter)
     const fullProfiles = await Promise.all(
       userItems.slice(0, 5).map(async (u) => {
         try {
@@ -613,17 +809,40 @@ async function checkGitHub(email: string, lang: Lang): Promise<EmailOsintSourceR
       }),
     );
 
+    const names: string[] = [];
+    const usernames: string[] = [];
+    const emails: string[] = [];
+    const locations: string[] = [];
+
     const formattedProfiles = fullProfiles.map((p) => {
+      usernames.push(p.login);
       const fields: string[] = [`${p.login} (${p.html_url})`];
-      if ('name' in p && p.name) fields.push(`${lang === 'tr' ? 'Ad' : 'Name'}: ${p.name}`);
-      if ('email' in p && p.email) fields.push(`${lang === 'tr' ? 'Açık E-posta' : 'Public Email'}: ${p.email}`);
-      if ('location' in p && p.location) fields.push(`${lang === 'tr' ? 'Konum/Adres' : 'Location'}: ${p.location}`);
+      if ('name' in p && p.name) {
+        names.push(p.name);
+        fields.push(`${lang === 'tr' ? 'Ad' : 'Name'}: ${p.name}`);
+      }
+      if ('email' in p && p.email) {
+        emails.push(p.email.toLowerCase());
+        fields.push(`${lang === 'tr' ? 'Açık E-posta' : 'Public Email'}: ${p.email}`);
+      }
+      if ('location' in p && p.location) {
+        locations.push(p.location);
+        fields.push(`${lang === 'tr' ? 'Konum/Adres' : 'Location'}: ${p.location}`);
+      }
       if ('company' in p && p.company) fields.push(`${lang === 'tr' ? 'Şirket' : 'Company'}: ${p.company}`);
       if ('blog' in p && p.blog) fields.push(`Web: ${p.blog}`);
-      if ('twitter_username' in p && p.twitter_username) fields.push(`X/Twitter: @${p.twitter_username}`);
+      if ('twitter_username' in p && p.twitter_username) {
+        usernames.push(p.twitter_username);
+        fields.push(`X/Twitter: @${p.twitter_username}`);
+      }
       if ('bio' in p && p.bio) fields.push(`Bio: ${p.bio}`);
       return fields.join(' | ');
     });
+
+    for (const c of commitItems) {
+      if (c.commit?.author?.name) names.push(c.commit.author.name);
+      if (c.commit?.author?.email) emails.push(c.commit.author.email.toLowerCase());
+    }
 
     const details: Record<string, string | string[]> = {};
     if (formattedProfiles.length > 0) {
@@ -640,21 +859,195 @@ async function checkGitHub(email: string, lang: Lang): Promise<EmailOsintSourceR
 
     const totalMatched = Math.max(userData.total_count || 0, commitData?.total_count || 0);
     return {
-      source: srcName,
-      status: 'found',
-      summary:
-        lang === 'tr'
-          ? `${totalMatched} açık GitHub eşleşmesi bulundu${userItems[0] ? ` (${userItems[0].login})` : ''}.`
-          : `Matched ${totalMatched} public GitHub result(s)${userItems[0] ? ` (${userItems[0].login})` : ''}.`,
-      details,
+      check: {
+        source: srcName,
+        status: 'found',
+        summary:
+          lang === 'tr'
+            ? `${totalMatched} açık GitHub eşleşmesi bulundu${userItems[0] ? ` (${userItems[0].login})` : ''}.`
+            : `Matched ${totalMatched} public GitHub result(s)${userItems[0] ? ` (${userItems[0].login})` : ''}.`,
+        details,
+      },
+      names,
+      usernames,
+      emails,
+      locations,
     };
   } catch {
     return {
-      source: srcName,
-      status: 'error',
-      summary: lang === 'tr' ? 'GitHub API zaman aşımı.' : 'GitHub API timed out.',
-      details: {},
+      ...empty,
+      check: {
+        source: srcName,
+        status: 'error',
+        summary: lang === 'tr' ? 'GitHub API zaman aşımı.' : 'GitHub API timed out.',
+        details: {},
+      },
     };
+  }
+}
+
+async function checkGitLab(
+  email: string,
+  lang: Lang,
+): Promise<{ check: EmailOsintSourceResult; names: string[]; usernames: string[] }> {
+  const srcName = lang === 'tr' ? 'GitLab Genel Profiller' : 'GitLab Public Profiles';
+  try {
+    const res = await fetchWithTimeout(
+      `https://gitlab.com/api/v4/users?search=${encodeURIComponent(email)}&per_page=5`,
+      {},
+      4200,
+    );
+    if (!res.ok) {
+      return { check: { source: srcName, status: 'error', summary: `HTTP ${res.status}`, details: {} }, names: [], usernames: [] };
+    }
+    const items = (await res.json()) as Array<{
+      username?: string;
+      name?: string;
+      state?: string;
+      web_url?: string;
+    }>;
+    if (!Array.isArray(items) || items.length === 0) {
+      return {
+        check: {
+          source: srcName,
+          status: 'not_found',
+          summary: lang === 'tr' ? 'GitLab genel profillerinde eşleşme bulunamadı.' : 'No public GitLab profiles matched.',
+          details: {},
+        },
+        names: [],
+        usernames: [],
+      };
+    }
+    const names = items.map((i) => i.name).filter(Boolean) as string[];
+    const usernames = items.map((i) => i.username).filter(Boolean) as string[];
+    const formatted = items.map((i) => `${i.username || '—'} (${i.name || '—'}) — ${i.web_url || ''}`);
+    return {
+      check: {
+        source: srcName,
+        status: 'found',
+        summary:
+          lang === 'tr'
+            ? `${items.length} açık GitLab profili bulundu.`
+            : `Matched ${items.length} public GitLab profile(s).`,
+        details: {
+          [lang === 'tr' ? 'profiller' : 'profiles']: formatted,
+        },
+      },
+      names,
+      usernames,
+    };
+  } catch {
+    return {
+      check: { source: srcName, status: 'error', summary: lang === 'tr' ? 'GitLab API zaman aşımı.' : 'GitLab API timed out.', details: {} },
+      names: [],
+      usernames: [],
+    };
+  }
+}
+
+async function checkNpmPublisher(
+  email: string,
+  lang: Lang,
+): Promise<{ check: EmailOsintSourceResult; usernames: string[] }> {
+  const srcName = 'npm Public Registry';
+  try {
+    const res = await fetchWithTimeout(
+      `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(email)}&size=10`,
+      {},
+      4200,
+    );
+    if (!res.ok) {
+      return { check: { source: srcName, status: 'error', summary: `HTTP ${res.status}`, details: {} }, usernames: [] };
+    }
+    const data = (await res.json()) as {
+      objects?: Array<{
+        package?: {
+          name?: string;
+          version?: string;
+          links?: { npm?: string };
+          publisher?: { username?: string; email?: string };
+          maintainers?: Array<{ username?: string; email?: string }>;
+        };
+      }>;
+    };
+    const exactEmail = email.trim().toLowerCase();
+    const matchedPkgs = (data.objects || []).filter((obj) => {
+      const p = obj.package;
+      if (!p) return false;
+      if (p.publisher?.email?.toLowerCase() === exactEmail) return true;
+      return Boolean(p.maintainers?.some((m) => m.email?.toLowerCase() === exactEmail));
+    });
+
+    if (matchedPkgs.length === 0) {
+      return {
+        check: {
+          source: srcName,
+          status: 'not_found',
+          summary: lang === 'tr' ? 'npm kayıtlarında yayıncı eşleşmesi yok.' : 'No npm package publisher matched.',
+          details: {},
+        },
+        usernames: [],
+      };
+    }
+
+    const usernames = new Set<string>();
+    const pkgList = matchedPkgs.slice(0, 6).map((obj) => {
+      const p = obj.package!;
+      if (p.publisher?.email?.toLowerCase() === exactEmail && p.publisher.username) {
+        usernames.add(p.publisher.username);
+      }
+      for (const m of p.maintainers || []) {
+        if (m.email?.toLowerCase() === exactEmail && m.username) usernames.add(m.username);
+      }
+      return `${p.name}@${p.version || 'latest'}${p.links?.npm ? ` (${p.links.npm})` : ''}`;
+    });
+
+    return {
+      check: {
+        source: srcName,
+        status: 'found',
+        summary:
+          lang === 'tr'
+            ? `${matchedPkgs.length} açık npm paketinde geliştirici e-postası eşleşti.`
+            : `Email matched maintainer/publisher on ${matchedPkgs.length} npm package(s).`,
+        details: {
+          ...(usernames.size > 0 ? { [lang === 'tr' ? 'gelistiriciAdlari' : 'npmUsernames']: Array.from(usernames) } : {}),
+          [lang === 'tr' ? 'paketler' : 'packages']: pkgList,
+        },
+      },
+      usernames: Array.from(usernames),
+    };
+  } catch {
+    return {
+      check: { source: srcName, status: 'error', summary: lang === 'tr' ? 'npm servisine ulaşılamadı.' : 'Could not reach npm registry.', details: {} },
+      usernames: [],
+    };
+  }
+}
+
+async function checkMicrosoftRealm(email: string, domain: string): Promise<string | null> {
+  if (!domain || domain.endsWith('.test') || domain.endsWith('.invalid') || domain.endsWith('.local')) {
+    return null;
+  }
+  try {
+    const res = await fetchWithTimeout(
+      `https://login.microsoftonline.com/getuserrealm.srf?login=${encodeURIComponent(email)}&json=1`,
+      {},
+      3200,
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      NameSpaceType?: string;
+      FederationBrandName?: string;
+    };
+    if (data.NameSpaceType && data.NameSpaceType !== 'Unknown') {
+      return data.FederationBrandName
+        ? `${data.NameSpaceType} (${data.FederationBrandName})`
+        : data.NameSpaceType;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -696,8 +1089,15 @@ interface CachedExternalOsint {
   mxRecords: { exchange: string; priority: number }[];
   spfRecord: string | null;
   dmarcRecord: string | null;
+  bimiRecord: string | null;
+  mtaStsRecord: string | null;
+  microsoftTenant: string | null;
   rdap: { registrar: string | null; createdDate: string | null; expiryDate: string | null } | null;
   externalChecks: EmailOsintSourceResult[];
+  discoveredNames: string[];
+  discoveredUsernames: string[];
+  discoveredEmails: string[];
+  discoveredLocations: string[];
   pivotLinks: { label: string; url: string }[];
 }
 
@@ -727,30 +1127,42 @@ async function resolveExternalOsintWithCoalescing(
       mxRes,
       txtRes,
       dmarcRes,
+      bimiRes,
+      mtaStsRes,
       disposableRes,
       rdap,
+      microsoftTenant,
       xon,
       leakCheck,
       hudsonRock,
       comb,
       protonPgp,
       openPgp,
+      ubuntuPgp,
       gravatar,
       github,
+      gitlab,
+      npmRes,
     ] = await Promise.all([
       dns.resolveMx(domain).catch(() => []),
       dns.resolveTxt(domain).catch(() => []),
       dns.resolveTxt(`_dmarc.${domain}`).catch(() => []),
+      dns.resolveTxt(`default._bimi.${domain}`).catch(() => []),
+      dns.resolveTxt(`_mta-sts.${domain}`).catch(() => []),
       checkDisposableEmail(email).catch(() => null),
       checkRdap(domain),
+      checkMicrosoftRealm(email, domain),
       checkXposedOrNot(email, lang),
       checkLeakCheckPublic(email, lang),
       checkHudsonRock(email, lang),
       checkProxyNovaComb(email, lang),
       checkProtonPgp(email, lang),
       checkOpenPgp(email, lang),
+      checkUbuntuKeyserver(email, lang),
       checkGravatar(email, lang),
       checkGitHub(email, lang),
+      checkGitLab(email, lang),
+      checkNpmPublisher(email, lang),
     ]);
 
     const isDisposable = Boolean(disposableRes?.isDisposable);
@@ -764,10 +1176,34 @@ async function resolveExternalOsintWithCoalescing(
     const flatDmarc = dmarcRes.map((chunks) => chunks.join(''));
     const dmarcRecord = flatDmarc.find((t) => t.toLowerCase().startsWith('v=dmarc1')) || null;
 
+    const bimiRecord = bimiRes.map((c) => c.join('')).find((t) => t.toLowerCase().startsWith('v=bimi1')) || null;
+    const mtaStsRecord = mtaStsRes.map((c) => c.join('')).find((t) => t.toLowerCase().startsWith('v=stsv1')) || null;
+
     const mailProvider = detectMailProvider(
       mxRecords.map((m) => m.exchange),
       domain,
       lang,
+    );
+
+    const discoveredNames = Array.from(
+      new Set([...gravatar.names, ...github.names, ...gitlab.names].map((x) => x.trim()).filter(Boolean)),
+    );
+    const discoveredUsernames = Array.from(
+      new Set(
+        [...gravatar.usernames, ...github.usernames, ...gitlab.usernames, ...npmRes.usernames]
+          .map((x) => x.trim())
+          .filter(Boolean),
+      ),
+    );
+    const discoveredEmails = Array.from(
+      new Set(
+        [...ubuntuPgp.altEmails, ...gravatar.emails, ...github.emails]
+          .map((x) => x.trim().toLowerCase())
+          .filter((e) => e && e !== email),
+      ),
+    );
+    const discoveredLocations = Array.from(
+      new Set([...gravatar.locations, ...github.locations].map((x) => x.trim()).filter(Boolean)),
     );
 
     const encodedEmail = encodeURIComponent(email);
@@ -793,8 +1229,27 @@ async function resolveExternalOsintWithCoalescing(
       mxRecords,
       spfRecord,
       dmarcRecord,
+      bimiRecord,
+      mtaStsRecord,
+      microsoftTenant,
       rdap,
-      externalChecks: [xon, leakCheck, hudsonRock, comb, protonPgp, openPgp, gravatar, github],
+      externalChecks: [
+        xon,
+        leakCheck,
+        hudsonRock,
+        comb,
+        gravatar.check,
+        github.check,
+        gitlab.check,
+        npmRes.check,
+        protonPgp,
+        openPgp,
+        ubuntuPgp.check,
+      ],
+      discoveredNames,
+      discoveredUsernames,
+      discoveredEmails,
+      discoveredLocations,
       pivotLinks,
     };
 
@@ -816,6 +1271,80 @@ async function resolveExternalOsintWithCoalescing(
   }
 }
 
+function summarizeLocalOsintSignals(
+  localMatches: IntelRecord[],
+): EmailOsintIdentitySummary['localExposedSignals'] & { usernames: string[] } {
+  const passwords = new Set<string>();
+  const tokens = new Set<string>();
+  const ips = new Set<string>();
+  const phones = new Set<string>();
+  const discordIds = new Set<string>();
+  const hwids = new Set<string>();
+  const usernames = new Set<string>();
+
+  for (const r of localMatches) {
+    if (r.username.trim()) usernames.add(r.username.trim());
+    if (r.ip.trim()) ips.add(r.ip.trim());
+    for (const ip of extractRecordIps(r)) ips.add(ip);
+    if (r.phone.trim() && !isTimestampLikeValue(r.phone)) phones.add(r.phone.trim());
+    for (const ph of extractRecordPhones(r)) phones.add(ph);
+    for (const sf of extractRecordSnowflakes(r)) discordIds.add(sf);
+    for (const [k, rawVal] of Object.entries(r.extra || {})) {
+      const cleanKey = k.trim().toLowerCase();
+      const val = String(rawVal || '').trim();
+      if (!val) continue;
+      if (/^(password|pass|pw|pwd|sifre|parola)$/i.test(cleanKey)) {
+        passwords.add(val);
+      } else if (/^(token|auth_token|access_token|secret)$/i.test(cleanKey)) {
+        tokens.add(val);
+      } else if (/^(hwid|hw_id|guid|machine_id)$/i.test(cleanKey) && val.length >= 4) {
+        hwids.add(val);
+      }
+    }
+    const existingHwidLower = new Set(Array.from(hwids).map((x) => x.toLowerCase()));
+    for (const eid of extractRecordExtraIdentifiers(r)) {
+      if (eid.startsWith('hwid:')) {
+        const val = eid.slice(5);
+        if (!existingHwidLower.has(val.toLowerCase())) {
+          hwids.add(val);
+          existingHwidLower.add(val.toLowerCase());
+        }
+      }
+    }
+  }
+
+  return {
+    passwords: Array.from(passwords).slice(0, 25),
+    tokens: Array.from(tokens).slice(0, 15),
+    ips: Array.from(ips).slice(0, 30),
+    phones: Array.from(phones).slice(0, 30),
+    discordIds: Array.from(discordIds).slice(0, 30),
+    hwids: Array.from(hwids).slice(0, 20),
+    usernames: Array.from(usernames).slice(0, 40),
+  };
+}
+
+export function mergeLocalSignalsIntoIdentitySummary(
+  identitySummary: EmailOsintIdentitySummary,
+  localMatches: IntelRecord[],
+): EmailOsintIdentitySummary {
+  const localSignals = summarizeLocalOsintSignals(localMatches);
+  return {
+    ...identitySummary,
+    discoveredUsernames: Array.from(
+      new Set([...identitySummary.discoveredUsernames, ...localSignals.usernames]),
+    ).slice(0, 50),
+    localExposedSignals: {
+      passwords: localSignals.passwords,
+      tokens: localSignals.tokens,
+      ips: localSignals.ips,
+      phones: localSignals.phones,
+      discordIds: localSignals.discordIds,
+      hwids: localSignals.hwids,
+    },
+  };
+}
+
 export async function runEmailOsint(
   rawEmail: string,
   localRecords: IntelRecord[],
@@ -826,11 +1355,18 @@ export async function runEmailOsint(
   const email = rawEmail.trim().toLowerCase();
   const isValidSyntax = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email);
   const domain = email.includes('@') ? email.split('@')[1] || '' : '';
+  const { canonical, isRoleAddress } = computeCanonicalEmail(email);
 
-  const correlated = email ? searchRecords(localRecords, email, 'email', true, localRecords, prebuiltIndex) : null;
   const localMatchesMap = new Map<string, IntelRecord>();
-  if (correlated) {
-    for (const r of [...correlated.primaryMatches, ...correlated.relatedMatches]) {
+  const primarySearch = email ? searchRecords(localRecords, email, 'email', true, localRecords, prebuiltIndex) : null;
+  if (primarySearch) {
+    for (const r of [...primarySearch.primaryMatches, ...primarySearch.relatedMatches]) {
+      localMatchesMap.set(r.id, r);
+    }
+  }
+  if (canonical && canonical !== email) {
+    const canonSearch = searchRecords(localRecords, canonical, 'email', true, localRecords, prebuiltIndex);
+    for (const r of [...canonSearch.primaryMatches, ...canonSearch.relatedMatches]) {
       localMatchesMap.set(r.id, r);
     }
   }
@@ -856,6 +1392,27 @@ export async function runEmailOsint(
   }
 
   const ext = await resolveExternalOsintWithCoalescing(email, domain, lang);
+  const baseSummary: EmailOsintIdentitySummary = {
+    canonicalEmail: canonical,
+    isRoleAddress,
+    spoofingRisk: evaluateSpoofingRisk(ext.spfRecord, ext.dmarcRecord),
+    bimiRecord: ext.bimiRecord,
+    mtaStsRecord: ext.mtaStsRecord,
+    microsoftTenant: ext.microsoftTenant,
+    discoveredNames: ext.discoveredNames,
+    discoveredUsernames: ext.discoveredUsernames,
+    discoveredEmails: ext.discoveredEmails,
+    discoveredLocations: ext.discoveredLocations,
+    localExposedSignals: {
+      passwords: [],
+      tokens: [],
+      ips: [],
+      phones: [],
+      discordIds: [],
+      hwids: [],
+    },
+  };
+  const identitySummary = mergeLocalSignalsIntoIdentitySummary(baseSummary, localMatches);
 
   return {
     email,
@@ -867,6 +1424,7 @@ export async function runEmailOsint(
     spfRecord: ext.spfRecord,
     dmarcRecord: ext.dmarcRecord,
     rdap: ext.rdap,
+    identitySummary,
     externalChecks: ext.externalChecks,
     localMatches,
     pivotLinks: ext.pivotLinks,
@@ -874,3 +1432,4 @@ export async function runEmailOsint(
     durationMs: Math.max(1, Number((performance.now() - started).toFixed(2))),
   };
 }
+

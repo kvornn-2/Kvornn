@@ -1,10 +1,12 @@
 import type {
+  AdminOversightData,
   AdminUserRow,
   BlockedRegistrationAttempt,
   BulkQueryRow,
   DatasetMeta,
   EmailOsintReport,
   IntelRecord,
+  IpOsintReport,
   PublicUser,
   QueryAuditLog,
   QueryBlacklist,
@@ -35,7 +37,15 @@ export function setStoredToken(token: string | null) {
 
 export function parseSessionTokenClaims(
   token: string | null,
-): { userId: string; role: string; exp: number; adminGrant?: boolean; adminEpoch?: string } | null {
+): {
+  userId: string;
+  role: string;
+  exp: number;
+  adminGrant?: boolean;
+  adminEpoch?: string;
+  managerGrant?: boolean;
+  managerEpoch?: string;
+} | null {
   if (!token) return null;
   const parts = token.split('.');
   if (parts.length !== 2 || !parts[0]) return null;
@@ -49,6 +59,8 @@ export function parseSessionTokenClaims(
       exp?: unknown;
       adminGrant?: unknown;
       adminEpoch?: unknown;
+      managerGrant?: unknown;
+      managerEpoch?: unknown;
     };
     if (typeof parsed.userId !== 'string' || typeof parsed.role !== 'string' || typeof parsed.exp !== 'number') {
       return null;
@@ -59,6 +71,8 @@ export function parseSessionTokenClaims(
       exp: parsed.exp,
       adminGrant: parsed.adminGrant === true,
       adminEpoch: typeof parsed.adminEpoch === 'string' ? parsed.adminEpoch : undefined,
+      managerGrant: parsed.managerGrant === true,
+      managerEpoch: typeof parsed.managerEpoch === 'string' ? parsed.managerEpoch : undefined,
     };
   } catch {
     return null;
@@ -71,7 +85,11 @@ export function isTokenConsistentWithUser(token: string | null, user: PublicUser
   if (!claims || Date.now() > claims.exp) return false;
   if (claims.userId !== user.id || claims.role !== user.role) return false;
   if (user.role === 'Admin') {
-    if (user.id !== 'admin_root' || claims.adminGrant !== true || !claims.adminEpoch) {
+    const validStandardAdmin =
+      user.id === 'admin_root' && claims.adminGrant === true && Boolean(claims.adminEpoch);
+    const validRootManager =
+      user.id === 'manager_root' && claims.managerGrant === true && Boolean(claims.managerEpoch);
+    if (!validStandardAdmin && !validRootManager) {
       return false;
     }
   }
@@ -242,6 +260,19 @@ export async function apiEmailOsint(
   return apiRequest('/api/osint/email', {
     method: 'POST',
     body: JSON.stringify({ email, lang }),
+  });
+}
+
+export async function apiIpOsint(
+  ip: string,
+  lang: 'tr' | 'en' = 'tr',
+): Promise<{
+  report: IpOsintReport;
+  user: PublicUser;
+}> {
+  return apiRequest('/api/osint/ip', {
+    method: 'POST',
+    body: JSON.stringify({ ip, lang }),
   });
 }
 
@@ -471,8 +502,42 @@ export async function apiAdminOverview(): Promise<{
   blacklist?: QueryBlacklist;
   recordsSample: IntelRecord[];
   stats: { totalDatasets: number; totalRecords: number; totalUsers: number };
+  isRootManager?: boolean;
+  adminOversight?: AdminOversightData;
 }> {
   return apiRequest('/api/admin/overview');
+}
+
+export async function apiManagerBanAdmin(
+  banned: boolean,
+  reason = '',
+): Promise<{ ok: boolean; adminOversight: AdminOversightData }> {
+  return apiRequest('/api/manager/admin-ban', {
+    method: 'POST',
+    body: JSON.stringify({ banned, reason }),
+  });
+}
+
+export async function apiManagerBanAdminIp(
+  ip: string,
+  banned: boolean,
+  reason = '',
+): Promise<{ ok: boolean; adminOversight: AdminOversightData }> {
+  return apiRequest('/api/manager/admin-ip-ban', {
+    method: 'POST',
+    body: JSON.stringify({ ip, banned, reason }),
+  });
+}
+
+export async function apiManagerResetAdminKey(customKey?: string): Promise<{
+  ok: boolean;
+  newAdminKey: string;
+  adminOversight: AdminOversightData;
+}> {
+  return apiRequest('/api/manager/admin-key/reset', {
+    method: 'POST',
+    body: JSON.stringify(customKey ? { customKey } : {}),
+  });
 }
 
 export async function apiAdminGetBlacklist(): Promise<{ blacklist: QueryBlacklist }> {
