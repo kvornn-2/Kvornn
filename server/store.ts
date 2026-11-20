@@ -57,6 +57,7 @@ import {
   verifyPassword,
   verifyPasswordAsync,
 } from './security.ts';
+import { BUILTIN_SEED_DATASETS, type BuiltinDatasetSeed } from './builtinData.ts';
 
 export interface StoredUser {
   id: string;
@@ -284,7 +285,7 @@ export class ServerStore {
   private managerDailyUsed = 0;
   private managerUsageDate = todayKey();
 
-  constructor(customDataDir?: string) {
+  constructor(customDataDir?: string, options?: { includeBuiltinDatasets?: boolean }) {
     this.dataDir = customDataDir ? path.resolve(customDataDir) : DEFAULT_DATA_DIR;
     this.usersFile = path.join(this.dataDir, 'users.json');
     this.rolesFile = path.join(this.dataDir, 'roles.json');
@@ -307,6 +308,9 @@ export class ServerStore {
       category: d.category || 'both',
     }));
     this.loadAllRecords();
+    if (options?.includeBuiltinDatasets ?? !customDataDir) {
+      this.hydrateBuiltinDatasets();
+    }
     const rawLogs = readJsonFile<QueryAuditLog[]>(this.logsFile, []);
     this.queryLogs = rawLogs.filter(
       (l) =>
@@ -416,6 +420,57 @@ export class ServerStore {
     }
 
     this.records = loaded;
+  }
+
+  hydrateBuiltinDatasets(seeds: BuiltinDatasetSeed[] = BUILTIN_SEED_DATASETS): number {
+    if (!Array.isArray(seeds) || seeds.length === 0) return 0;
+    let addedTotal = 0;
+
+    for (let s = 0; s < seeds.length; s++) {
+      const seed = seeds[s];
+      if (!seed?.meta?.id || !Array.isArray(seed.records) || seed.records.length === 0) continue;
+
+      const normalizedSeedRecords: IntelRecord[] = seed.records.map((r, idx) => ({
+        ...r,
+        id: r.id || `${seed.meta.id}_builtin_${idx}`,
+        datasetId: seed.meta.id,
+        datasetName: seed.meta.name,
+        dbType: r.dbType || classifyRecordDatabaseType(r),
+      }));
+
+      const existingDs = this.datasets.find((d) => d.id === seed.meta.id);
+      if (!existingDs) {
+        this.addDataset(
+          {
+            ...seed.meta,
+            storageMode: 'memory',
+            ingestionStatus: 'ready',
+            category: seed.meta.category || 'both',
+          },
+          normalizedSeedRecords,
+        );
+        addedTotal += normalizedSeedRecords.length;
+        continue;
+      }
+
+      if (existingDs.storageMode === 'disk') {
+        continue;
+      }
+
+      const existingIds = new Set<string>();
+      for (let i = 0; i < this.records.length; i++) {
+        if (this.records[i].datasetId === seed.meta.id) {
+          existingIds.add(this.records[i].id);
+        }
+      }
+      const missingRecords = normalizedSeedRecords.filter((r) => !existingIds.has(r.id));
+      if (missingRecords.length > 0) {
+        this.appendDatasetBatch(seed.meta.id, missingRecords);
+        addedTotal += missingRecords.length;
+      }
+    }
+
+    return addedTotal;
   }
 
   private initSecrets() {
